@@ -61,7 +61,6 @@ def fill_holes_limited(binary, max_hole_px=350):
     return binary | small[lbl]
 
 def remove_border_artifacts(binary, edge_map=None, max_area_ratio=0.04):
-    """이미지 최외곽 테두리에 걸친 배경/그림자 덩어리 제거"""
     h, w = binary.shape
     struct = nd.generate_binary_structure(2, 2)
     lbl, num = nd.label(binary, structure=struct)
@@ -81,12 +80,13 @@ def remove_border_artifacts(binary, edge_map=None, max_area_ratio=0.04):
 
     remove_ids = []
     for bid in border_ids:
+        # 화면의 35% 이상을 덮는 초대형 밀집 군집(동전 무리 등)은 배경 테두리가 아니므로 보존
+        if sizes[bid] > (h * w * 0.35):
+            continue
         sides = sum([bid in top_ids, bid in bot_ids, bid in left_ids, bid in right_ids])
-        # 모서리(2면 이상)에 닿거나, 테두리에 4픽셀 이상 붙어 있는 외곽 그림자/베젤 제거
         if sides >= 2 or b_counts[bid] >= 4 or sizes[bid] > (h * w * max_area_ratio):
             remove_ids.append(bid)
         elif edge_map is not None:
-            # 테두리에 살짝 닿았더라도 에지 강도가 약한 조명 얼룩이면 제거
             if float(np.mean(edge_map[lbl == bid])) < 25.0:
                 remove_ids.append(bid)
 
@@ -115,7 +115,7 @@ def get_hpf_edge(f_img):
     return edge_map, valley_norm.astype(np.uint8)
 
 # ---------------------------------------------------------
-# 겹친 블록 군집 분할 함수 (단일 대형 부품은 보존, 겹친 블록만 분할)
+# 겹친 블록 군집 분할 함수 (단일 대형 검은 부품은 보호, 겹친 블록만 분할)
 # ---------------------------------------------------------
 def split_overlapping_blocks(binary, f_raw, edge_map, valley_map, r_med, unit_area):
     struct = nd.generate_binary_structure(2, 2)
@@ -140,26 +140,25 @@ def split_overlapping_blocks(binary, f_raw, edge_map, valley_map, r_med, unit_ar
         x0, x1 = sl[1].start, sl[1].stop
         sub_mask = (lbl[y0:y1, x0:x1] == cid)
 
-        # 단일 블록 크기(1.45배 이하)는 그대로 유지
         if c_area <= unit_area * 1.45:
             curr_id += 1
             final_lbl[y0:y1, x0:x1][sub_mask] = curr_id
             final_bin[y0:y1, x0:x1][sub_mask] = True
             continue
 
-        # 단일 대형 직사각형 부품인지 판별 (바운딩 박스 채움률이 높고 내부가 균일한 어두운 부품은 분할 금지)
+        # [수정 1] 좌상단 큰 검은 물체(image_7a0e44)처럼 바운딩 박스 채움률이 높고 내부가 어두운 단일 물체는 쪼개지 않고 1개로 유지
         bbox_fill = c_area / float(max(1, (y1 - y0) * (x1 - x0)))
         sub_raw = f_raw[y0:y1, x0:x1]
         core_eroded = nd.binary_erosion(sub_mask, iterations=max(1, int(r_med * 0.4)))
         raw_std = float(np.std(sub_raw[core_eroded])) if np.any(core_eroded) else 25.0
+        raw_med = float(np.median(sub_raw[sub_mask]))
 
-        if bbox_fill > 0.66 and raw_std < 14.0:
+        if (bbox_fill > 0.50 and raw_std < 24.0) or (bbox_fill > 0.46 and raw_med < 78.0):
             curr_id += 1
             final_lbl[y0:y1, x0:x1][sub_mask] = curr_id
             final_bin[y0:y1, x0:x1][sub_mask] = True
             continue
 
-        # 겹친 블록 군집: 단위 면적 비례 K개 시드 배치 및 HPF 가중 분할
         k_num = int(np.clip(round(c_area / unit_area), 2, 35))
         ys, xs = np.nonzero(sub_mask)
         coords = np.column_stack((ys.astype(np.float64), xs.astype(np.float64)))
@@ -277,57 +276,73 @@ def split_crossed_sticks(binary, unit_area, clump_ratio=1.28):
 
     return final_bin, final_lbl, curr_id
 
-def segment_packed_circles(f_raw, f_denoised, border_med):
-    f_diff = np.clip(border_med - f_denoised, 0, None)
-    p99 = np.percentile(f_diff, 99.5)
-    f_norm = np.clip(f_diff / (p99 + 1e-6) * 255.0, 0, 255).astype(np.uint8)
-    edge_map, _ = get_hpf_edge(f_raw)
-
-    t_val = 28
-    bw = remove_border_artifacts(f_norm > t_val, edge_map, max_area_ratio=0.05)
-    bw = fill_holes_limited(bw, max_hole_px=35)
-    bw = nd.binary_opening(bw, structure=disk_kernel(1))
-
-    edt = nd.distance_transform_edt(bw)
-    r_est = float(np.percentile(edt[edt > 0], 82)) if np.any(edt > 0) else 15.0
-    r_est = float(np.clip(r_est, 8.0, 32.0))
-
-    f_smooth_dome = nd.gaussian_filter(f_norm.astype(np.float64), sigma=r_est * 0.35)
-    edge_smooth = nd.gaussian_filter(edge_map.astype(np.float64) / 255.0, sigma=1.5)
-    dome_score = (edt / (r_est + 1e-6)) * 0.65 + (f_smooth_dome / 255.0) * 0.35 - 0.30 * edge_smooth
-    dome_score = nd.gaussian_filter(dome_score, sigma=max(1.2, r_est * 0.2))
-    dome_score[~bw] = 0.0
-
-    fp_size = max(7, int(round(r_est * 1.25)))
-    local_max = (dome_score == nd.maximum_filter(dome_score, size=fp_size)) & (edt > r_est * 0.38)
-    local_max = nd.binary_dilation(local_max, structure=disk_kernel(max(1, int(r_est * 0.18))))
-
+# [수정 2] 화면의 35% 이상이 한 덩어리로 붙은 고밀도 동전(image_7a0b7b) 전용 분할 함수
+def split_massive_coin_cluster(bw_opened, f_norm, edge_map, valley_map):
     struct = nd.generate_binary_structure(2, 2)
-    markers, num_seeds = nd.label(local_max, structure=struct)
+    # HPF 테두리 에지와 골짜기가 강한 경계선을 마스킹하여 붙어 있는 동전들의 내부 코어 분리
+    e_cut = edge_map > np.percentile(edge_map[bw_opened], 68)
+    v_cut = valley_map > np.percentile(valley_map[bw_opened], 68)
+    cores = bw_opened & (~(e_cut | v_cut))
+    cores = nd.binary_opening(cores, structure=disk_kernel(1))
+    cores = fill_holes_limited(cores, max_hole_px=120)
 
-    if num_seeds > 1:
-        markers_ws = markers.astype(np.int32)
-        markers_ws[~bw] = num_seeds + 1
-        cost = (255.0 - np.clip(dome_score / (dome_score.max() + 1e-6) * 200.0, 0, 200) + edge_smooth * 55.0).astype(np.uint8)
-        ws = nd.watershed_ift(cost, markers_ws)
-        ws_fg = np.where((ws >= 1) & (ws <= num_seeds), ws, 0)
+    edt_core = nd.distance_transform_edt(cores)
+    edt_full = nd.distance_transform_edt(bw_opened)
+
+    # 동전 반경(r_coin) 자동 추정
+    peaks = (edt_core == nd.maximum_filter(edt_core, size=11)) & (edt_core > 4.0)
+    r_coin = float(np.median(edt_core[peaks])) if np.any(peaks) else 14.0
+    r_coin = float(np.clip(r_coin, 9.0, 26.0))
+
+    # 동전 내부 각인(숫자/무늬)을 부드럽게 뭉개고 동전 중심에서 단일 봉우리가 되도록 스무딩
+    edge_norm = nd.gaussian_filter(edge_map.astype(np.float64) / 255.0, sigma=1.5)
+    score_map = (0.65 * edt_core + 0.35 * np.minimum(edt_full, r_coin * 1.3)) * (1.0 - 0.45 * edge_norm)
+    score_smooth = nd.gaussian_filter(score_map, sigma=max(2.0, r_coin * 0.28))
+    score_smooth[~bw_opened] = 0.0
+
+    # 최소 이격 거리(r_sep)를 유지하며 동전 중심 시드(Seed) 추출
+    r_sep = max(11.0, r_coin * 1.15)
+    temp = score_smooth.copy()
+    seeds = []
+    max_coins = int(np.sum(bw_opened) / max(50.0, np.pi * (r_coin ** 2) * 0.55))
+
+    for _ in range(max_coins):
+        idx = int(np.argmax(temp))
+        yy, xx = np.unravel_index(idx, temp.shape)
+        if temp[yy, xx] < r_coin * 0.25:
+            break
+        seeds.append((yy, xx))
+        Y, X = np.ogrid[:temp.shape[0], :temp.shape[1]]
+        temp[((Y - yy) ** 2 + (X - xx) ** 2) <= (r_sep ** 2)] = 0.0
+
+    if len(seeds) >= 2:
+        markers = np.zeros(bw_opened.shape, dtype=np.int32)
+        for s_idx, (sy, sx) in enumerate(seeds, start=1):
+            markers[sy, sx] = s_idx
+        markers = nd.grey_dilation(markers, size=(3, 3))
+        markers[~bw_opened] = len(seeds) + 1
+
+        inv_d = 255.0 - np.clip(score_smooth / (score_smooth.max() + 1e-6) * 190.0, 0, 190)
+        cost = np.clip(inv_d + edge_norm * 65.0, 0, 255).astype(np.uint8)
+        ws = nd.watershed_ift(cost, markers)
+        ws_fg = np.where((ws >= 1) & (ws <= len(seeds)), ws, 0)
 
         max_nb = nd.maximum_filter(ws_fg, size=3)
-        min_nb = nd.minimum_filter(np.where(ws_fg > 0, ws_fg, num_seeds + 5), size=3)
+        min_nb = nd.minimum_filter(np.where(ws_fg > 0, ws_fg, len(seeds) + 5), size=3)
         ridge = (ws_fg > 0) & (max_nb != min_nb)
-        bw_final = bw & (~ridge)
+        bw_split = bw_opened & (~ridge)
 
-        min_coin_area = max(25, int(np.pi * (r_est ** 2) * 0.22))
-        lbl_f, num_f = nd.label(bw_final, structure=struct)
+        lbl_f, num_f = nd.label(bw_split, structure=struct)
         sizes_f = np.bincount(lbl_f.ravel())
-        keep = sizes_f >= min_coin_area
+        min_coin_a = max(30, int(np.pi * (r_coin ** 2) * 0.22))
+        keep = sizes_f >= min_coin_a
         keep[0] = False
         bw_final = keep[lbl_f]
         lbl_f, num_f = nd.label(bw_final, structure=struct)
-        return f_norm, edge_map, bw_final, lbl_f, num_f, t_val, 1
+        return bw_final, lbl_f, num_f
 
-    lbl_f, num_f = nd.label(bw, structure=struct)
-    return f_norm, edge_map, bw, lbl_f, num_f, t_val, 1
+    lbl_f, num_f = nd.label(bw_opened, structure=struct)
+    return bw_opened, lbl_f, num_f
 
 # ---------------------------------------------------------
 # 메인 영상처리 파이프라인
@@ -384,13 +399,20 @@ def process_image(img_pil, manual=None):
             bw = keep[lbl]
             lbl, num = nd.label(bw, structure=struct)
             if manual["split"] and num > 0:
-                edt_m = nd.distance_transform_edt(bw)
-                r_m = float(np.percentile(edt_m[edt_m > 0], 80)) if np.any(edt_m > 0) else 6.0
-                valid_s = np.bincount(lbl.ravel())[1:]
-                unit_a = float(np.percentile(valid_s, 35))
-                bw, lbl, num = split_overlapping_blocks(bw, f_raw, edge_map, valley_map, r_m, unit_a)
+                if np.max(np.bincount(lbl.ravel())[1:]) > (h * w * 0.35):
+                    bw, lbl, num = split_massive_coin_cluster(bw, f_norm, edge_map, valley_map)
+                else:
+                    edt_m = nd.distance_transform_edt(bw)
+                    r_m = float(np.percentile(edt_m[edt_m > 0], 80)) if np.any(edt_m > 0) else 6.0
+                    valid_s = np.bincount(lbl.ravel())[1:]
+                    unit_a = float(np.percentile(valid_s, 35))
+                    bw, lbl, num = split_overlapping_blocks(bw, f_raw, edge_map, valley_map, r_m, unit_a)
 
-        centroids = nd.center_of_mass(lbl > 0, lbl, range(1, num + 1)) if num > 0 else []
+        centroids = []
+        if num > 0:
+            u_ids = [i for i in range(1, int(lbl.max()) + 1) if np.any(lbl == i)]
+            num = len(u_ids)
+            centroids = nd.center_of_mass(lbl > 0, lbl, u_ids)
         return {
             "original_gray": np.array(gray_resized), "corrected": f_norm, "edge_map": edge_map,
             "binary_final": bw, "labeled": lbl, "count": num, "centroids": centroids,
@@ -437,24 +459,13 @@ def process_image(img_pil, manual=None):
                 "thresh": t_val, "open_r": 0, "is_inverted": False
             }
 
-    # 2. 순백색 배경 위 고밀도 동전 판별
-    if border_med > 225 and max_dark_ratio > 0.30:
-        f_norm, edge_map, bw, lbl, num, t_val, open_r = segment_packed_circles(f_raw, f_denoised, border_med)
-        centroids = nd.center_of_mass(lbl > 0, lbl, range(1, num + 1)) if num > 0 else []
-        return {
-            "original_gray": np.array(gray_resized), "corrected": f_norm, "edge_map": edge_map,
-            "binary_final": bw, "labeled": lbl, "count": num, "centroids": centroids,
-            "thresh": t_val, "open_r": open_r, "is_inverted": True
-        }
-
-    # 3. 극성 판별 (키보드처럼 좌우에 검은 키가 걸려도 상하단 베젤이 밝고 어두운 영역 비중이 크면 반전 적용)
+    # 2. 극성 판별
     is_keyboard_like = bool(top_bot_med > 160 and np.mean(f_denoised < 85) > 0.22 and np.percentile(border_px, 75) > 175)
     is_inverted = bool(border_med > 135 or is_keyboard_like)
 
-    # 4-A. 어두운/중간톤 배경 위 밝은 타겟 (면봉, 쌀알, 흰 종이 조각, 보도블럭 위 낙엽)
+    # 3-A. 어두운/중간톤 배경 위 밝은 타겟 (면봉, 쌀알, 흰 종이 조각, 보도블럭 위 낙엽)
     if not is_inverted:
         if border_med < 92:
-            # 어두운 배경 (면봉, 쌀알, 흰 종이 조각)
             bg_surface = nd.gaussian_filter(f_denoised, sigma=42.0)
             f_diff = np.clip(f_denoised - bg_surface, 0, None)
             p99 = np.percentile(f_diff, 99.5)
@@ -493,8 +504,6 @@ def process_image(img_pil, manual=None):
                     bw = keep[lbl]
                     lbl, num = nd.label(bw, structure=struct)
         else:
-            # 보도블럭·아스팔트 위 낙엽 처리:
-            # 상위 78% 백분위수로 돌 표면 상단 밝기를 추출해 차감함으로써 줄눈 및 돌 표면 얼룩 노이즈를 0으로 억제
             f_smooth5 = signal.medfilt2d(f_raw, kernel_size=5)
             f_small = f_smooth5[::2, ::2]
             bg_s = nd.percentile_filter(f_small, percentile=78, size=25)
@@ -504,7 +513,6 @@ def process_image(img_pil, manual=None):
             f_leaf = nd.gaussian_filter(f_smooth5, sigma=1.0)
             f_diff = np.clip(f_leaf - bg_stone, 0, None)
 
-            # 원시 밝기 차이가 최소 18 이상인 뚜렷한 낙엽만 통과하도록 스케일 고정
             max_scale = max(float(np.percentile(f_diff, 99.8)), 50.0)
             f_norm = np.clip(f_diff / max_scale * 255.0, 0, 255).astype(np.uint8)
             edge_map, _ = get_hpf_edge(f_norm)
@@ -540,7 +548,7 @@ def process_image(img_pil, manual=None):
             "thresh": t_val, "open_r": open_r, "is_inverted": False
         }
 
-    # 4-B. 밝은 배경 위 어두운 타겟 (키보드, 20/25개 블록, 겹친 레고 블록, 귤 13개, 소형 부품 + 큰 검은 부품)
+    # 3-B. 밝은 배경 위 어두운 타겟 (키보드, 20/25개 블록, 겹친 레고 블록, 귤 13개, 소형 부품 + 큰 검은 물체, 밀집 동전)
     f_small = f_denoised[::4, ::4]
     bg_s = nd.percentile_filter(f_small, percentile=88, size=25)
     bg_s = nd.gaussian_filter(bg_s, sigma=5.0)
@@ -555,15 +563,12 @@ def process_image(img_pil, manual=None):
     otsu_t = get_otsu_threshold(f_norm)
     t_val = int(np.clip(otsu_t * 0.78, 45, 120))
 
-    # 키보드 판별: 어두운 자판 영역이 전체 화면의 22% 이상을 차지하고 사각형 키가 밀집한 경우에만 진입
-    # (소형 부품 사진 image_8ad94d는 전경 비율이 ~5%이므로 절대 키보드 분기로 들어가지 않음)
-    if is_keyboard_like or (np.mean(f_denoised < 95) > 0.22):
-        # 검은 자판 위의 작은 흰색 글자 구멍을 먼저 메운 뒤, 은색 격자선(f_denoised > 115)을 따라 절단
+    # 키보드 판별
+    if is_keyboard_like or (np.mean(f_denoised < 95) > 0.22 and border_med < 220):
         key_raw = f_denoised < 105
         key_solid = fill_holes_limited(key_raw, max_hole_px=90)
         silver_grid = (f_denoised > 112) | (valley_map > np.percentile(valley_map, 82))
         bw_keys = key_solid & (~silver_grid)
-        # 하단 트랙패드 영역 제거
         bw_keys = remove_border_artifacts(bw_keys, max_area_ratio=0.03)
         open_r = 2
         bw_keys = nd.binary_opening(bw_keys, structure=disk_kernel(open_r))
@@ -585,10 +590,9 @@ def process_image(img_pil, manual=None):
                 "thresh": t_val, "open_r": open_r, "is_inverted": True
             }
 
-    # 일반 입체 블록(20/25개 블록), 겹친 레고 블록, 귤 13개, 회색 바닥 위 소형 부품 + 큰 검은 부품
+    # 일반 입체 블록, 겹친 레고 블록, 귤 13개, 소형 부품 + 큰 검은 물체, 밀집 동전
     bw = remove_border_artifacts(f_norm > t_val, edge_map, max_area_ratio=0.055)
 
-    # 회색 바닥 위에 어두운 부품과 밝은 부품이 함께 있는 경우(image_8ad94d) 밝은 부품 병합
     if 135 <= border_med <= 200 and border_mad < 12.0:
         bg_med_flat = nd.gaussian_filter(f_denoised, sigma=35.0)
         bright_parts = remove_border_artifacts((f_denoised - bg_med_flat) > 36.0, max_area_ratio=0.01)
@@ -602,7 +606,6 @@ def process_image(img_pil, manual=None):
     r_med = float(np.median(edt[peaks])) if np.any(peaks) else 7.0
     r_med = float(np.clip(r_med, 2.5, 42.0))
 
-    # 접합부 목(Neck) 부분 HPF 골짜기 절단
     neck_zone = (edt > 0) & (edt <= r_med * 0.50)
     cut_px = (valley_map > np.percentile(valley_map, 86)) & neck_zone
     bw_carved = bw & (~cut_px)
@@ -612,28 +615,32 @@ def process_image(img_pil, manual=None):
     bw_opened = fill_holes_limited(bw_opened, max_hole_px=300)
     bw_opened = remove_border_artifacts(bw_opened, edge_map, max_area_ratio=0.055)
 
-    # 얇은 그림자 파편 제거 및 겹친 블록 군집 분할 (단일 대형 검은 부품은 상한선 없이 보존)
     struct = nd.generate_binary_structure(2, 2)
     lbl_1, num_1 = nd.label(bw_opened, structure=struct)
     if num_1 > 0:
-        edt_1 = nd.distance_transform_edt(bw_opened)
-        comp_max_r = np.array(nd.maximum(edt_1, lbl_1, index=range(1, num_1 + 1)))
         comp_sizes = np.bincount(lbl_1.ravel())[1:]
 
-        thick_mask = comp_max_r >= (r_med * 0.42)
-        valid_areas = comp_sizes[thick_mask] if np.any(thick_mask) else comp_sizes
-        # 하위 25%~65% 구간의 중앙값으로 단일 객체 1개의 기준 면적(unit_area) 산출
-        q25, q65 = np.percentile(valid_areas, [25, 65])
-        single_s = valid_areas[(valid_areas >= q25) & (valid_areas <= q65)]
-        unit_area = float(np.median(single_s)) if len(single_s) > 0 else float(np.median(valid_areas))
+        # [수정 2] 만약 단일 연결 덩어리가 화면 전체의 35% 이상을 덮는 경우(밀집 동전 image_7a0b7b),
+        # 동전 전용 HPF-Watershed 분할기를 실행
+        if np.max(comp_sizes) > (h * w * 0.35):
+            bw_final, lbl_f, num_f = split_massive_coin_cluster(bw_opened, f_norm, edge_map, valley_map)
+        else:
+            edt_1 = nd.distance_transform_edt(bw_opened)
+            comp_max_r = np.array(nd.maximum(edt_1, lbl_1, index=range(1, num_1 + 1)))
 
-        keep_ids = np.zeros(num_1 + 1, dtype=bool)
-        for idx_c in range(num_1):
-            if comp_max_r[idx_c] >= (r_med * 0.42) and comp_sizes[idx_c] >= (unit_area * 0.32):
-                keep_ids[idx_c + 1] = True
-        bw_clean = keep_ids[lbl_1]
+            thick_mask = comp_max_r >= (r_med * 0.42)
+            valid_areas = comp_sizes[thick_mask] if np.any(thick_mask) else comp_sizes
+            q25, q65 = np.percentile(valid_areas, [25, 65])
+            single_s = valid_areas[(valid_areas >= q25) & (valid_areas <= q65)]
+            unit_area = float(np.median(single_s)) if len(single_s) > 0 else float(np.median(valid_areas))
 
-        bw_final, lbl_f, num_f = split_overlapping_blocks(bw_clean, f_raw, edge_map, valley_map, r_med, unit_area)
+            keep_ids = np.zeros(num_1 + 1, dtype=bool)
+            for idx_c in range(num_1):
+                if comp_max_r[idx_c] >= (r_med * 0.42) and comp_sizes[idx_c] >= (unit_area * 0.32):
+                    keep_ids[idx_c + 1] = True
+            bw_clean = keep_ids[lbl_1]
+
+            bw_final, lbl_f, num_f = split_overlapping_blocks(bw_clean, f_raw, edge_map, valley_map, r_med, unit_area)
     else:
         bw_final, lbl_f, num_f = bw_opened, lbl_1, 0
 
@@ -668,86 +675,4 @@ if mode == "수동 설정":
     split_opt = st.sidebar.checkbox("붙은 객체 분할", value=True)
 
     manual_cfg = {
-        "invert": invert_opt, "med_k": med_k_opt, "use_bg": use_bg_opt,
-        "bg_sigma": bg_sig_opt, "hpf_w": hpf_w_opt, "thresh": thresh_opt,
-        "open_r": open_r_opt, "min_area": min_area_opt, "split": split_opt
-    }
-
-uploaded_files = st.file_uploader(
-    "이미지 파일 업로드",
-    type=["tif", "tiff", "png", "jpg", "jpeg", "bmp"],
-    accept_multiple_files=True
-)
-
-if uploaded_files:
-    summary_data = []
-    tabs = st.tabs([file.name for file in uploaded_files])
-
-    for idx, (tab, uploaded_file) in enumerate(zip(tabs, uploaded_files)):
-        img_pil = Image.open(uploaded_file)
-
-        with tab:
-            with st.expander("개별 파라미터 수동 조정"):
-                c1, c2, c3, c4 = st.columns(4)
-                use_ind = c1.checkbox("수동 적용", value=False, key=f"ind_{idx}")
-                ind_inv = c1.checkbox("명암 반전", value=True, key=f"inv_{idx}", disabled=not use_ind)
-                ind_t = c2.slider("임계값 (T)", 5, 250, 75, 1, key=f"t_{idx}", disabled=not use_ind)
-                ind_r = c3.slider("Opening 반경 (R)", 0, 6, 1, 1, key=f"r_{idx}", disabled=not use_ind)
-                ind_min = c4.slider("최소 면적 (px)", 5, 300, 20, 5, key=f"m_{idx}", disabled=not use_ind)
-
-            if use_ind:
-                local_manual = {
-                    "invert": ind_inv, "med_k": 3, "use_bg": True, "bg_sigma": 40.0,
-                    "hpf_w": 0.45, "thresh": ind_t, "open_r": ind_r,
-                    "min_area": ind_min, "split": True
-                }
-                res = process_image(img_pil, manual=local_manual)
-            else:
-                res = process_image(img_pil, manual=manual_cfg)
-
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("검출된 객체 수", f"{res['count']} 개")
-            m2.metric("적용 임계값", f"T = {res['thresh']}")
-            m3.metric("Opening 반경", f"R = {res['open_r']}")
-            m4.metric("명암 반전", "적용됨" if res["is_inverted"] else "원본 유지")
-
-            fig, axes = plt.subplots(1, 5, figsize=(20, 4.5))
-
-            axes[0].imshow(res["original_gray"], cmap="gray")
-            axes[0].set_title("1. Grayscale Input")
-            axes[0].axis("off")
-
-            axes[1].imshow(res["corrected"], cmap="gray")
-            axes[1].set_title("2. Preprocessed")
-            axes[1].axis("off")
-
-            axes[2].imshow(res["edge_map"], cmap="inferno")
-            axes[2].set_title("3. HPF Edge")
-            axes[2].axis("off")
-
-            axes[3].imshow(res["binary_final"], cmap="gray")
-            axes[3].set_title(f"4. Binary (R={res['open_r']}, T={res['thresh']})")
-            axes[3].axis("off")
-
-            axes[4].imshow(res["labeled"], cmap="nipy_spectral")
-            axes[4].set_title(f"5. Counted: {res['count']}")
-            axes[4].axis("off")
-
-            for cy, cx in res["centroids"]:
-                axes[4].plot(cx, cy, "w+", markersize=6, markeredgewidth=1.2)
-
-            plt.tight_layout()
-            st.pyplot(fig)
-            plt.close(fig)
-
-        summary_data.append({
-            "파일명": uploaded_file.name,
-            "해상도": f"{img_pil.width} x {img_pil.height}",
-            "검출된 객체 수": res["count"],
-            "적용 임계값": res["thresh"],
-            "Opening 반경": res["open_r"]
-        })
-
-    st.divider()
-    st.subheader("전체 카운팅 결과 요약")
-    st.dataframe(summary_data, use_container_width=True)
+        "invert": invert_opt, "med_k": med_k_opt,
