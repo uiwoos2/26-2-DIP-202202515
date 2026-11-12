@@ -11,9 +11,7 @@ st.set_page_config(
     layout="wide"
 )
 
-# ---------------------------------------------------------
-# 유틸리티 함수 (기존 알고리즘 100% 동일 유지)
-# ---------------------------------------------------------
+
 def get_otsu_threshold(img_uint8):
     if img_uint8.size == 0:
         return 127
@@ -116,9 +114,7 @@ def get_hpf_edge(f_img):
     edge_map = np.clip(0.55 * sobel_norm + 0.45 * valley_norm, 0, 255).astype(np.uint8)
     return edge_map, valley_norm.astype(np.uint8)
 
-# ---------------------------------------------------------
-# 겹친 객체 및 군집 분할 함수 (기존 알고리즘 100% 동일 유지)
-# ---------------------------------------------------------
+
 def split_overlapping_blocks(binary, f_raw, edge_map, valley_map, r_med, unit_area):
     struct = nd.generate_binary_structure(2, 2)
     lbl, num = nd.label(binary, structure=struct)
@@ -340,9 +336,6 @@ def split_massive_coin_cluster(bw_opened, f_norm, edge_map, valley_map):
     lbl_f, num_f = nd.label(bw_opened, structure=struct)
     return bw_opened, lbl_f, num_f
 
-# ---------------------------------------------------------
-# 메인 영상처리 파이프라인 (기존 알고리즘 100% 동일 유지)
-# ---------------------------------------------------------
 def process_image(img_pil, manual=None):
     gray_full = img_pil.convert("RGB").convert("L")
     gray_resized = resize_image(gray_full, max_dim=512)
@@ -415,8 +408,7 @@ def process_image(img_pil, manual=None):
             "thresh": t_val, "open_r": open_r, "is_inverted": is_inv
         }
 
-    # [자동 설정 모드]
-    # 1. 가방 속 흰색 숫자 판별
+   
     dark_reg = remove_border_artifacts(f_denoised < (otsu_g * 0.90), max_area_ratio=0.15)
     lbl_d, num_d = nd.label(dark_reg)
     max_dark_ratio = (np.max(np.bincount(lbl_d.ravel())[1:]) / float(h * w)) if num_d > 0 else 0.0
@@ -455,11 +447,9 @@ def process_image(img_pil, manual=None):
                 "thresh": t_val, "open_r": 0, "is_inverted": False
             }
 
-    # 2. 극성 판별
     is_keyboard_like = bool(top_bot_med > 160 and np.mean(f_denoised < 85) > 0.22 and np.percentile(border_px, 75) > 175)
     is_inverted = bool(border_med > 135 or is_keyboard_like)
 
-    # 3-A. 어두운/중간톤 배경 위 밝은 타겟
     if not is_inverted:
         if border_med < 92:
             bg_surface = nd.gaussian_filter(f_denoised, sigma=42.0)
@@ -544,7 +534,6 @@ def process_image(img_pil, manual=None):
             "thresh": t_val, "open_r": open_r, "is_inverted": False
         }
 
-    # 3-B. 밝은 배경 위 어두운 타겟
     f_small = f_denoised[::4, ::4]
     bg_s = nd.percentile_filter(f_small, percentile=88, size=25)
     bg_s = nd.gaussian_filter(bg_s, sigma=5.0)
@@ -648,9 +637,7 @@ def process_image(img_pil, manual=None):
         "thresh": t_val, "open_r": open_r, "is_inverted": True
     }
 
-# ---------------------------------------------------------
-# UI 레이아웃 및 사이드바 구성
-# ---------------------------------------------------------
+#사이드바
 st.markdown("### 202202515 이수민 HW06")
 st.title("Digital Image Processing - Object Counting")
 st.divider()
@@ -678,7 +665,7 @@ with st.sidebar:
             bg_sig_opt = st.slider("배경 Sigma", 15.0, 80.0, 40.0, step=5.0, disabled=not use_bg_opt)
 
         with st.expander("2. 에지 및 이진화", expanded=True):
-            hpf_w_opt = st.slider("HPF 에지 가중치", 0.0, 1.2, 0.45, step=0.05)
+            hpf_w_opt = st.slider("HPF Edge 가중치", 0.0, 1.2, 0.45, step=0.05)
             thresh_opt = st.slider("임계값 (Threshold)", 5, 250, 75, step=1)
 
         with st.expander("3. 형태학 및 후처리", expanded=True):
@@ -693,7 +680,7 @@ with st.sidebar:
         }
 
 uploaded_files = st.file_uploader(
-    "분석할 이미지 파일을 선택하세요 (다중 업로드 지원)",
+    "분석할 이미지 파일을 선택",
     type=["tif", "tiff", "png", "jpg", "jpeg", "bmp"],
     accept_multiple_files=True
 )
@@ -775,5 +762,5 @@ if uploaded_files:
         })
 
     st.divider()
-    st.subheader("📊 전체 이미지 카운팅 요약")
+    st.subheader("전체 이미지 카운팅 요약")
     st.dataframe(summary_data, use_container_width=True, hide_index=True)
