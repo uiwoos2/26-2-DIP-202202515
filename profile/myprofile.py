@@ -60,7 +60,7 @@ def fill_holes_limited(binary, max_hole_px=350):
     small[border_ids] = False
     return binary | small[lbl]
 
-def remove_border_artifacts(binary, max_area_ratio=0.04):
+def remove_border_artifacts(binary, max_area_ratio=0.045):
     h, w = binary.shape
     struct = nd.generate_binary_structure(2, 2)
     lbl, num = nd.label(binary, structure=struct)
@@ -91,7 +91,7 @@ def remove_border_artifacts(binary, max_area_ratio=0.04):
     return binary
 
 def get_hpf_edge(f_img):
-    f_s = nd.gaussian_filter(f_img.astype(np.float64), sigma=1.2)
+    f_s = nd.gaussian_filter(f_img.astype(np.float64), sigma=1.1)
     gx = nd.sobel(f_s, axis=1)
     gy = nd.sobel(f_s, axis=0)
     sobel = np.hypot(gx, gy)
@@ -108,13 +108,9 @@ def get_hpf_edge(f_img):
     return edge_map, valley_norm.astype(np.uint8)
 
 # ---------------------------------------------------------
-# 겹친 덩어리 조건부 분할 함수
+# 겹친 군집 분할 함수 (HPF 내부 경계 + 거리 피크 Watershed)
 # ---------------------------------------------------------
-def split_overlapping_clumps(binary, edge_map, r_med, med_area):
-    """
-    단일 객체는 보존하고, 기준 면적의 1.38배를 초과하며 내부에 실제 거리 피크/경계가 존재하는
-    겹친 블록·인접 블록 덩어리만 Watershed로 분할
-    """
+def split_clumps_watershed(binary, f_raw, edge_map, valley_map, r_med, med_area):
     struct = nd.generate_binary_structure(2, 2)
     lbl, num = nd.label(binary, structure=struct)
     if num == 0:
@@ -124,9 +120,13 @@ def split_overlapping_clumps(binary, edge_map, r_med, med_area):
     slices = nd.find_objects(lbl)
     out_bw = binary.copy()
 
+    # 내부 경계선 추출용 임계값
+    v_thresh = np.percentile(valley_map, 82)
+    e_thresh = np.percentile(edge_map, 80)
+
     for cid in range(1, num + 1):
         c_area = sizes[cid]
-        if c_area <= med_area * 1.38:
+        if c_area <= med_area * 1.35:
             continue
 
         sl = slices[cid - 1]
@@ -134,29 +134,37 @@ def split_overlapping_clumps(binary, edge_map, r_med, med_area):
         x0, x1 = max(0, sl[1].start - 2), min(binary.shape[1], sl[1].stop + 2)
         sub_mask = (lbl[y0:y1, x0:x1] == cid)
 
-        # 내부 에지 밀도가 매우 낮고 두께가 균일한 단일 대형 부품은 분할하지 않음
-        sub_edt = nd.distance_transform_edt(sub_mask)
-        sub_edge = edge_map[y0:y1, x0:x1].astype(np.float64) / 255.0
-        inner_zone = sub_edt > (r_med * 0.35)
-        inner_edge_mean = float(np.mean(sub_edge[inner_zone])) if np.any(inner_zone) else 0.0
-
-        # 2개 블록 수준(1.38~2.3배)은 잘록한 목이나 에지가 있을 때 분할, 대형 군집(>2.3배)은 내부 에지가 뚜렷할 때만 분할
-        if c_area > med_area * 2.3 and inner_edge_mean < 0.16:
+        # 단일 대형 균일 부품(내부 밝기 편차가 매우 작고 볼록한 직사각형 형태)은 분할 제외
+        sub_raw = f_raw[y0:y1, x0:x1]
+        eroded_core = nd.binary_erosion(sub_mask, iterations=2)
+        raw_std = float(np.std(sub_raw[eroded_core])) if np.any(eroded_core) else 20.0
+        bbox_fill = c_area / float(max(1, (y1 - y0) * (x1 - x0)))
+        if bbox_fill > 0.68 and raw_std < 9.5 and c_area > med_area * 2.2:
             continue
 
-        max_targets = int(np.clip(round(c_area / (med_area * 0.92)), 2, 30))
-        score_map = sub_edt * (1.0 - 0.45 * sub_edge)
-        score_smooth = nd.gaussian_filter(score_map, sigma=max(1.0, r_med * 0.22))
+        # 군집 내부의 HPF 골짜기/에지를 잘라내어 내부 블록들의 개별 거리 중심(Peak)이 살아나도록 유도
+        sub_val = valley_map[y0:y1, x0:x1]
+        sub_edg = edge_map[y0:y1, x0:x1]
+        internal_walls = (sub_val > v_thresh) | (sub_edg > e_thresh)
+        core_mask = sub_mask & (~internal_walls)
+
+        edt_full = nd.distance_transform_edt(sub_mask)
+        edt_core = nd.distance_transform_edt(core_mask)
+        sub_edge_norm = sub_edg.astype(np.float64) / 255.0
+
+        score_map = (0.55 * edt_core + 0.45 * edt_full) * (1.0 - 0.40 * sub_edge_norm)
+        score_smooth = nd.gaussian_filter(score_map, sigma=max(0.9, r_med * 0.20))
         score_smooth[~sub_mask] = 0.0
 
+        target_k = int(np.clip(round(c_area / (med_area * 0.88)), 2, 40))
         seeds = []
-        r_sep = max(4.0, r_med * 0.95)
+        r_sep = max(3.5, r_med * 0.72)
         temp = score_smooth.copy()
 
-        for _ in range(max_targets):
+        for _ in range(target_k):
             idx = int(np.argmax(temp))
             yy, xx = np.unravel_index(idx, temp.shape)
-            if temp[yy, xx] < r_med * 0.38:
+            if temp[yy, xx] < r_med * 0.28:
                 break
             seeds.append((yy, xx))
             Y, X = np.ogrid[:temp.shape[0], :temp.shape[1]]
@@ -169,8 +177,8 @@ def split_overlapping_clumps(binary, edge_map, r_med, med_area):
             markers = nd.grey_dilation(markers, size=(3, 3))
             markers[~sub_mask] = len(seeds) + 1
 
-            inv_d = 255.0 - np.clip(score_smooth / (score_smooth.max() + 1e-6) * 200.0, 0, 200)
-            cost = np.clip(inv_d + sub_edge * 55.0, 0, 255).astype(np.uint8)
+            inv_d = 255.0 - np.clip(score_smooth / (score_smooth.max() + 1e-6) * 190.0, 0, 190)
+            cost = np.clip(inv_d + sub_edge_norm * 65.0, 0, 255).astype(np.uint8)
             ws = nd.watershed_ift(cost, markers)
             ws_fg = np.where((ws >= 1) & (ws <= len(seeds)), ws, 0)
 
@@ -184,8 +192,7 @@ def split_overlapping_clumps(binary, edge_map, r_med, med_area):
 
     return out_bw
 
-def split_crossed_sticks(binary, edge_map, unit_area, clump_ratio=1.28):
-    """세장비(Elongation)가 매우 큰 막대/면봉이 교차하거나 맞닿은 경우에만 K개로 분할"""
+def split_crossed_sticks(binary, unit_area, clump_ratio=1.28):
     struct = nd.generate_binary_structure(2, 2)
     lbl, num = nd.label(binary, structure=struct)
     if num == 0:
@@ -251,6 +258,58 @@ def split_crossed_sticks(binary, edge_map, unit_area, clump_ratio=1.28):
 
     return final_bin, final_lbl, curr_id
 
+def segment_packed_circles(f_raw, f_denoised, border_med):
+    f_diff = np.clip(border_med - f_denoised, 0, None)
+    p99 = np.percentile(f_diff, 99.5)
+    f_norm = np.clip(f_diff / (p99 + 1e-6) * 255.0, 0, 255).astype(np.uint8)
+    edge_map, _ = get_hpf_edge(f_raw)
+
+    t_val = 28
+    bw = remove_border_artifacts(f_norm > t_val, max_area_ratio=0.05)
+    bw = fill_holes_limited(bw, max_hole_px=35)
+    bw = nd.binary_opening(bw, structure=disk_kernel(1))
+
+    edt = nd.distance_transform_edt(bw)
+    r_est = float(np.percentile(edt[edt > 0], 82)) if np.any(edt > 0) else 15.0
+    r_est = float(np.clip(r_est, 8.0, 32.0))
+
+    f_smooth_dome = nd.gaussian_filter(f_norm.astype(np.float64), sigma=r_est * 0.35)
+    edge_smooth = nd.gaussian_filter(edge_map.astype(np.float64) / 255.0, sigma=1.5)
+    dome_score = (edt / (r_est + 1e-6)) * 0.65 + (f_smooth_dome / 255.0) * 0.35 - 0.30 * edge_smooth
+    dome_score = nd.gaussian_filter(dome_score, sigma=max(1.2, r_est * 0.2))
+    dome_score[~bw] = 0.0
+
+    fp_size = max(7, int(round(r_est * 1.25)))
+    local_max = (dome_score == nd.maximum_filter(dome_score, size=fp_size)) & (edt > r_est * 0.38)
+    local_max = nd.binary_dilation(local_max, structure=disk_kernel(max(1, int(r_est * 0.18))))
+
+    struct = nd.generate_binary_structure(2, 2)
+    markers, num_seeds = nd.label(local_max, structure=struct)
+
+    if num_seeds > 1:
+        markers_ws = markers.astype(np.int32)
+        markers_ws[~bw] = num_seeds + 1
+        cost = (255.0 - np.clip(dome_score / (dome_score.max() + 1e-6) * 200.0, 0, 200) + edge_smooth * 55.0).astype(np.uint8)
+        ws = nd.watershed_ift(cost, markers_ws)
+        ws_fg = np.where((ws >= 1) & (ws <= num_seeds), ws, 0)
+
+        max_nb = nd.maximum_filter(ws_fg, size=3)
+        min_nb = nd.minimum_filter(np.where(ws_fg > 0, ws_fg, num_seeds + 5), size=3)
+        ridge = (ws_fg > 0) & (max_nb != min_nb)
+        bw_final = bw & (~ridge)
+
+        min_coin_area = max(25, int(np.pi * (r_est ** 2) * 0.22))
+        lbl_f, num_f = nd.label(bw_final, structure=struct)
+        sizes_f = np.bincount(lbl_f.ravel())
+        keep = sizes_f >= min_coin_area
+        keep[0] = False
+        bw_final = keep[lbl_f]
+        lbl_f, num_f = nd.label(bw_final, structure=struct)
+        return f_norm, edge_map, bw_final, lbl_f, num_f, t_val, 1
+
+    lbl_f, num_f = nd.label(bw, structure=struct)
+    return f_norm, edge_map, bw, lbl_f, num_f, t_val, 1
+
 # ---------------------------------------------------------
 # 메인 영상처리 파이프라인
 # ---------------------------------------------------------
@@ -307,7 +366,7 @@ def process_image(img_pil, manual=None):
                 edt_m = nd.distance_transform_edt(bw)
                 r_m = float(np.percentile(edt_m[edt_m > 0], 80)) if np.any(edt_m > 0) else 6.0
                 med_a = float(np.median(np.bincount(lbl.ravel())[1:]))
-                bw = split_overlapping_clumps(bw, edge_map, r_m, med_a)
+                bw = split_clumps_watershed(bw, f_raw, edge_map, valley_map, r_m, med_a)
                 lbl, num = nd.label(bw, structure=struct)
 
         centroids = nd.center_of_mass(lbl > 0, lbl, range(1, num + 1)) if num > 0 else []
@@ -318,7 +377,7 @@ def process_image(img_pil, manual=None):
         }
 
     # [자동 설정 모드]
-    # 1. 가방 속 흰색 숫자 여부 확인 (균일한 검정 가방 본체 내부에 밝은 숫자가 있는 경우)
+    # 1. 가방 속 흰색 숫자 여부 확인 (균일한 검정 가방 본체 내부에 흰 숫자가 있는 경우)
     dark_reg = remove_border_artifacts(f_denoised < (otsu_g * 0.90), max_area_ratio=0.15)
     lbl_d, num_d = nd.label(dark_reg)
     max_dark_ratio = (np.max(np.bincount(lbl_d.ravel())[1:]) / float(h * w)) if num_d > 0 else 0.0
@@ -326,7 +385,7 @@ def process_image(img_pil, manual=None):
     if border_med > 140 and 0.16 <= max_dark_ratio <= 0.72:
         bag_id = int(np.argmax(np.bincount(lbl_d.ravel())[1:])) + 1
         bag_mask = (lbl_d == bag_id)
-        if float(np.median(f_denoised[bag_mask])) < 60.0 and float(np.std(f_denoised[bag_mask])) < 32.0:
+        if float(np.median(f_denoised[bag_mask])) < 58.0 and float(np.std(f_denoised[bag_mask])) < 30.0:
             bag_filled = fill_holes_limited(bag_mask, max_hole_px=2500)
             bag_body = nd.binary_opening(bag_filled, structure=disk_kernel(11))
             bag_body = nd.binary_fill_holes(bag_body)
@@ -357,25 +416,24 @@ def process_image(img_pil, manual=None):
                 "thresh": t_val, "open_r": 0, "is_inverted": False
             }
 
-    # 2. 타겟 극성(밝은 타겟 vs 어두운 타겟) 자동 판별
-    # 얇은 보도블럭 줄눈(음의 틈새)을 먼저 닫아준 뒤 대구경 가우시안 배경과 비교
-    f_closed = nd.grey_closing(f_denoised, size=(7, 7))
-    bg_broad = nd.gaussian_filter(f_closed, sigma=45.0)
+    # 2. 순백색 배경 위 고밀도 동전 판별
+    if border_med > 225 and max_dark_ratio > 0.30:
+        f_norm, edge_map, bw, lbl, num, t_val, open_r = segment_packed_circles(f_raw, f_denoised, border_med)
+        centroids = nd.center_of_mass(lbl > 0, lbl, range(1, num + 1)) if num > 0 else []
+        return {
+            "original_gray": np.array(gray_resized), "corrected": f_norm, "edge_map": edge_map,
+            "binary_final": bw, "labeled": lbl, "count": num, "centroids": centroids,
+            "thresh": t_val, "open_r": open_r, "is_inverted": True
+        }
 
-    bright_salience = float(np.percentile(np.clip(f_denoised - bg_broad, 0, None), 99.0))
-    dark_salience = float(np.percentile(np.clip(bg_broad - f_closed, 0, None), 99.0))
+    # 3. 외곽 배경 밝기 기준 극성 결정 (border_med > 135이면 항상 밝은 배경 / 어두운 타겟)
+    is_inverted = bool(border_med > 135)
 
-    # 테두리가 밝고(border_med > 135) 어두운 돌출 에너지가 더 크면 어두운 타겟(귤, 블록, 부품, 동전, 자판)으로 판별
-    is_inverted = bool(border_med > 135 and dark_salience > bright_salience * 0.85)
-
-    # 3-A. 밝은 타겟 처리 (면봉, 흰 종이 조각, 보도블럭/아스팔트 위 낙엽, 쌀알 등)
+    # 4-A. 어두운/텍스처 배경 위 밝은 타겟 (면봉, 쌀알, 흰 종이 조각, 보도블럭/아스팔트 위 낙엽)
     if not is_inverted:
-        f_smooth5 = signal.medfilt2d(f_raw, kernel_size=5)
-        f_closed5 = nd.grey_closing(f_smooth5, size=(7, 7))
-        bg_surface = nd.gaussian_filter(f_closed5, sigma=38.0)
-
-        # 어두운 배경(면봉, 종이 조각)은 3x3 노이즈 제거 영상 사용, 거친 아스팔트(낙엽)는 5x5 스무딩 영상 사용
-        if border_med < 95:
+        if border_med < 92:
+            # 어두운 배경 (면봉, 쌀알, 어두운 바닥 위 흰 종이 조각)
+            bg_surface = nd.gaussian_filter(f_denoised, sigma=42.0)
             f_diff = np.clip(f_denoised - bg_surface, 0, None)
             p99 = np.percentile(f_diff, 99.5)
             f_norm = np.clip(f_diff / (p99 + 1e-6) * 255.0, 0, 255).astype(np.uint8)
@@ -383,11 +441,11 @@ def process_image(img_pil, manual=None):
 
             otsu_t = get_otsu_threshold(f_norm)
             t_val = max(40, int(otsu_t * 0.85))
-            bw = fill_holes_limited(f_norm > t_val, max_hole_px=400)
+            bw = fill_holes_limited(f_norm > t_val, max_hole_px=450)
 
             open_r = 1
             bw = nd.binary_opening(bw, structure=disk_kernel(open_r))
-            bw = fill_holes_limited(bw, max_hole_px=400)
+            bw = fill_holes_limited(bw, max_hole_px=450)
 
             struct = nd.generate_binary_structure(2, 2)
             lbl, num = nd.label(bw, structure=struct)
@@ -397,8 +455,8 @@ def process_image(img_pil, manual=None):
                 comp_r = nd.maximum(edt, lbl, index=range(1, num + 1))
                 elongations = comp_areas / (np.pi * (np.maximum(comp_r, 1.0) ** 2))
 
-                # 세장비가 4.0 이상인 얇고 긴 막대(면봉)인 경우에만 교차/접촉 분할 수행 (종이 조각은 분할 안 함)
-                if float(np.median(elongations)) > 4.0:
+                # 가늘고 긴 막대(면봉)인 경우에만 교차 분할 적용
+                if float(np.median(elongations)) > 3.8:
                     cut_px = (valley_map > np.percentile(valley_map, 88)) & (edt > 0) & (edt <= 2.5)
                     bw = nd.binary_opening(bw & (~cut_px), structure=disk_kernel(1))
                     lbl, num = nd.label(bw, structure=struct)
@@ -406,7 +464,7 @@ def process_image(img_pil, manual=None):
                     valid_s = sizes[sizes >= 20]
                     if len(valid_s) > 0:
                         unit_a = float(np.percentile(valid_s, 40))
-                        bw, lbl, num = split_crossed_sticks(bw, edge_map, unit_a, clump_ratio=1.28)
+                        bw, lbl, num = split_crossed_sticks(bw, unit_a, clump_ratio=1.28)
                 else:
                     med_a = float(np.median(comp_areas))
                     keep = np.bincount(lbl.ravel()) >= max(15, med_a * 0.22)
@@ -414,33 +472,46 @@ def process_image(img_pil, manual=None):
                     bw = keep[lbl]
                     lbl, num = nd.label(bw, structure=struct)
         else:
-            # 아스팔트·보도블럭 위 낙엽 처리 (단일 낙엽 쪼개짐 방지 및 자갈 노이즈 억제)
+            # 보도블럭·아스팔트 위 낙엽 처리
+            f_smooth5 = signal.medfilt2d(f_raw, kernel_size=5)
+            # 어두운 줄눈/균열을 먼저 메운 뒤 중구경(sigma=14) 필터로 돌 표면의 명암 얼룩 제거
+            f_closed5 = nd.grey_closing(f_smooth5, size=(7, 7))
+            bg_stone = nd.gaussian_filter(f_closed5, sigma=14.0)
+
             f_leaf = nd.gaussian_filter(f_smooth5, sigma=1.0)
-            f_diff = np.clip(f_leaf - bg_surface, 0, None)
+            f_diff = np.clip(f_leaf - bg_stone, 0, None)
 
             bg_floor = f_diff[f_diff <= np.percentile(f_diff, 85)]
             noise_std = float(np.std(bg_floor)) + 1.0
-            raw_thresh = max(18.0, float(np.mean(bg_floor)) + 5.0 * noise_std)
+            raw_thresh = max(18.0, float(np.mean(bg_floor)) + 5.2 * noise_std)
 
-            max_scale = max(float(np.percentile(f_diff, 99.8)), 42.0)
+            max_scale = max(float(np.percentile(f_diff, 99.8)), 45.0)
             f_norm = np.clip(f_diff / max_scale * 255.0, 0, 255).astype(np.uint8)
             edge_map, _ = get_hpf_edge(f_norm)
 
-            t_val = int(np.clip(raw_thresh / max_scale * 255.0, 42, 125))
+            otsu_t = get_otsu_threshold(f_norm)
+            t_val = int(np.clip(max(raw_thresh / max_scale * 255.0, otsu_t * 0.85, 55), 52, 135))
             bw = fill_holes_limited(f_norm > t_val, max_hole_px=300)
 
             open_r = 1
             bw = nd.binary_opening(bw, structure=disk_kernel(open_r))
             bw = fill_holes_limited(bw, max_hole_px=300)
 
+            # 히스테리시스 검증: 중심부 최대 밝기(Peak)가 충분히 밝은 실제 낙엽만 남기고 바닥 노이즈 배제
             struct = nd.generate_binary_structure(2, 2)
             lbl, num = nd.label(bw, structure=struct)
             if num > 0:
                 sizes = np.bincount(lbl.ravel())
-                valid_fg = sizes[1:][sizes[1:] >= 12]
+                peak_vals = np.array(nd.maximum(f_norm, lbl, index=range(1, num + 1)))
+                valid_fg = sizes[1:][sizes[1:] >= 10]
                 med_a = float(np.median(valid_fg)) if len(valid_fg) > 0 else 16.0
-                keep = (sizes >= max(12, int(med_a * 0.22))) & (sizes <= (bw.size * 0.03))
-                keep[0] = False
+                min_a = max(10, int(med_a * 0.22))
+
+                keep = np.zeros(num + 1, dtype=bool)
+                core_min = max(t_val + 28, 108)
+                for i in range(1, num + 1):
+                    if min_a <= sizes[i] <= (bw.size * 0.03) and peak_vals[i - 1] >= core_min:
+                        keep[i] = True
                 bw = keep[lbl]
                 lbl, num = nd.label(bw, structure=struct)
 
@@ -451,72 +522,109 @@ def process_image(img_pil, manual=None):
             "thresh": t_val, "open_r": open_r, "is_inverted": False
         }
 
-    # 3-B. 어두운 타겟 처리 (귤, 블록, 소형 부품, 키보드 자판, 밀집 동전)
-    # 배경 조명 그라데이션 추정
-    bg_high = nd.gaussian_filter(nd.grey_dilation(f_denoised, size=(15, 15)), sigma=45.0)
-    bg_high = np.maximum(bg_high, bg_broad)
-    f_diff = np.clip(bg_high - f_denoised, 0, None)
+    # 4-B. 밝은 배경 위 어두운 타겟 (20/25개 블록, 겹친 레고 블록, 귤 13개, 키보드, 회색 바닥 위 부품)
+    # 큰 어두운 객체(귤, 키보드 등)에도 배경이 함몰되지 않도록 대구경 상위 포락선(88%)으로 배경 조명 추정
+    f_small = f_denoised[::4, ::4]
+    bg_s = nd.percentile_filter(f_small, percentile=88, size=25)
+    bg_s = nd.gaussian_filter(bg_s, sigma=5.0)
+    bg_high = np.array(Image.fromarray(bg_s.astype(np.float32)).resize((w, h), Image.Resampling.BILINEAR), dtype=np.float64)
 
-    p99 = np.percentile(f_diff, 99.5)
-    f_norm = np.clip(f_diff / (p99 + 1e-6) * 255.0, 0, 255).astype(np.uint8)
+    # 반사율 정규화: (B - I) / B -> 그림자 영역에 놓인 외곽 블록(20번째 블록)도 중앙 블록과 동일한 대비로 복원
+    refl_drop = np.clip((bg_high - f_denoised) / np.maximum(bg_high, 65.0), 0.0, 1.0)
+    p995 = np.percentile(refl_drop, 99.5)
+    f_norm_lin = np.clip(refl_drop / (p995 + 1e-6), 0.0, 1.0)
+    # 밝은 회색 레고 블록도 누락되지 않도록 완만한 감마(0.82) 적용
+    f_norm = np.clip((f_norm_lin ** 0.82) * 255.0, 0, 255).astype(np.uint8)
     edge_map, valley_map = get_hpf_edge(f_norm)
 
     otsu_t = get_otsu_threshold(f_norm)
-    t_val = int(np.clip(otsu_t * 0.88, 45, 140))
+    t_val = int(np.clip(otsu_t * 0.80, 48, 125))
 
-    bw = remove_border_artifacts(f_norm > t_val, max_area_ratio=0.05)
+    # 키보드 격자 여부 판별 (사각형 충실도가 높은 다수의 어두운 키가 밀집한 경우)
+    bw_probe = remove_border_artifacts((f_norm > t_val) & (f_denoised < border_med - 40))
+    lbl_p, num_p = nd.label(bw_probe)
+    rect_fills = []
+    if num_p >= 20:
+        sizes_p = np.bincount(lbl_p.ravel())[1:]
+        for idx, sl in enumerate(nd.find_objects(lbl_p)):
+            if sl is not None and sizes_p[idx] > 35:
+                ba = (sl[0].stop - sl[0].start) * (sl[1].stop - sl[1].start)
+                rect_fills.append(sizes_p[idx] / float(max(1, ba)))
 
-    # 평탄한 회색 바닥 위에 어두운 부품과 밝은 부품이 함께 있는 경우(image_94e0fd) 밝은 부품 병합
-    if 135 <= border_med <= 200 and border_mad < 12.0:
-        bright_parts = remove_border_artifacts((f_denoised - bg_broad) > 38.0, max_area_ratio=0.01)
-        bright_parts = nd.binary_opening(bright_parts, structure=disk_kernel(1))
-        bw = bw | bright_parts
+    if len(rect_fills) >= 20 and np.median(rect_fills) > 0.70:
+        # 키보드 자판 전용 분리: 은색 격자선(HPF 골짜기)을 강하게 절단하고 하단 트랙패드 그림자 배제
+        f_cut = np.clip(f_norm.astype(np.float64) - 0.75 * valley_map.astype(np.float64), 0, 255)
+        bw = (f_cut > max(t_val, 85)) & (f_denoised < (border_med - 45))
+        bw = remove_border_artifacts(bw, max_area_ratio=0.03)
+        open_r = 2
+        bw = nd.binary_opening(bw, structure=disk_kernel(open_r))
+        bw = fill_holes_limited(bw, max_hole_px=80)
 
-    bw = fill_holes_limited(bw, max_hole_px=250)
-
-    # 객체 두께(내접 반경) 측정
-    edt = nd.distance_transform_edt(bw)
-    peaks = (edt == nd.maximum_filter(edt, size=7)) & (edt > 2.0)
-    r_med = float(np.median(edt[peaks])) if np.any(peaks) else 7.0
-    r_med = float(np.clip(r_med, 2.5, 38.0))
-
-    # 접합부 목(Neck) 부분에만 HPF 골짜기 차감 적용
-    neck_zone = (edt > 0) & (edt <= r_med * 0.55)
-    cut_px = (valley_map > np.percentile(valley_map, 85)) & neck_zone
-    bw_carved = bw & (~cut_px)
-
-    open_r = 1 if r_med < 8.0 else 2
-    bw_opened = nd.binary_opening(bw_carved, structure=disk_kernel(open_r))
-    bw_opened = fill_holes_limited(bw_opened, max_hole_px=250)
-
-    # 얇은 그림자 파편 제거 (정상 객체 두께 r_med의 50% 미만인 얇은 초승달 그림자 소거)
-    struct = nd.generate_binary_structure(2, 2)
-    lbl_1, num_1 = nd.label(bw_opened, structure=struct)
-    if num_1 > 0:
-        edt_1 = nd.distance_transform_edt(bw_opened)
-        comp_max_r = np.array(nd.maximum(edt_1, lbl_1, index=range(1, num_1 + 1)))
-        comp_sizes = np.bincount(lbl_1.ravel())[1:]
-
-        thick_mask = comp_max_r >= (r_med * 0.50)
-        valid_areas = comp_sizes[thick_mask] if np.any(thick_mask) else comp_sizes
-        med_area = float(np.percentile(valid_areas, 45)) if len(valid_areas) > 0 else 25.0
-
-        keep_ids = np.zeros(num_1 + 1, dtype=bool)
-        for idx_c in range(num_1):
-            if comp_max_r[idx_c] >= (r_med * 0.50) and comp_sizes[idx_c] >= (med_area * 0.38):
-                keep_ids[idx_c + 1] = True
-        bw_clean = keep_ids[lbl_1]
-
-        # 겹친 블록이나 맞닿은 두 블록만 조건부 분할 (단일 블록이나 내부 에지 없는 큰 부품은 보존)
-        bw_final = split_overlapping_clumps(bw_clean, edge_map, r_med, med_area)
-        lbl_f, num_f = nd.label(bw_final, structure=struct)
-        sizes_f = np.bincount(lbl_f.ravel())
-        keep_f = sizes_f >= (med_area * 0.35)
-        keep_f[0] = False
-        bw_final = keep_f[lbl_f]
-        lbl_f, num_f = nd.label(bw_final, structure=struct)
+        struct = nd.generate_binary_structure(2, 2)
+        lbl_f, num_f = nd.label(bw, structure=struct)
+        if num_f > 0:
+            sizes_f = np.bincount(lbl_f.ravel())
+            med_a = float(np.median(sizes_f[1:]))
+            keep = (sizes_f >= max(20, med_a * 0.22)) & (sizes_f <= med_a * 7.5)
+            keep[0] = False
+            bw_final = keep[lbl_f]
+            lbl_f, num_f = nd.label(bw_final, structure=struct)
+        else:
+            bw_final = bw
     else:
-        bw_final, lbl_f, num_f = bw_opened, lbl_1, 0
+        # 일반 입체 블록(20/25개 블록), 겹친 레고 블록, 귤 13개, 회색 바닥 위 부품
+        bw = remove_border_artifacts(f_norm > t_val, max_area_ratio=0.055)
+
+        # 회색 바닥 위에 어두운 부품과 밝은 부품이 함께 있는 경우(image_94e0fd) 밝은 부품 병합
+        if 135 <= border_med <= 200 and border_mad < 12.0:
+            bg_med_flat = nd.gaussian_filter(f_denoised, sigma=35.0)
+            bright_parts = remove_border_artifacts((f_denoised - bg_med_flat) > 38.0, max_area_ratio=0.01)
+            bright_parts = nd.binary_opening(bright_parts, structure=disk_kernel(1))
+            bw = bw | bright_parts
+
+        bw = fill_holes_limited(bw, max_hole_px=280)
+
+        edt = nd.distance_transform_edt(bw)
+        peaks = (edt == nd.maximum_filter(edt, size=7)) & (edt > 2.0)
+        r_med = float(np.median(edt[peaks])) if np.any(peaks) else 7.0
+        r_med = float(np.clip(r_med, 2.5, 42.0))
+
+        # 접합부 목(Neck) 부분 HPF 골짜기 절단
+        neck_zone = (edt > 0) & (edt <= r_med * 0.50)
+        cut_px = (valley_map > np.percentile(valley_map, 86)) & neck_zone
+        bw_carved = bw & (~cut_px)
+
+        open_r = 1 if r_med < 8.5 else 2
+        bw_opened = nd.binary_opening(bw_carved, structure=disk_kernel(open_r))
+        bw_opened = fill_holes_limited(bw_opened, max_hole_px=280)
+
+        # 그림자 파편 제거 및 겹친 블록 군집 분할
+        struct = nd.generate_binary_structure(2, 2)
+        lbl_1, num_1 = nd.label(bw_opened, structure=struct)
+        if num_1 > 0:
+            edt_1 = nd.distance_transform_edt(bw_opened)
+            comp_max_r = np.array(nd.maximum(edt_1, lbl_1, index=range(1, num_1 + 1)))
+            comp_sizes = np.bincount(lbl_1.ravel())[1:]
+
+            thick_mask = comp_max_r >= (r_med * 0.42)
+            valid_areas = comp_sizes[thick_mask] if np.any(thick_mask) else comp_sizes
+            med_area = float(np.percentile(valid_areas, 45)) if len(valid_areas) > 0 else 25.0
+
+            keep_ids = np.zeros(num_1 + 1, dtype=bool)
+            for idx_c in range(num_1):
+                if comp_max_r[idx_c] >= (r_med * 0.42) and comp_sizes[idx_c] >= (med_area * 0.30):
+                    keep_ids[idx_c + 1] = True
+            bw_clean = keep_ids[lbl_1]
+
+            bw_final = split_clumps_watershed(bw_clean, f_raw, edge_map, valley_map, r_med, med_area)
+            lbl_f, num_f = nd.label(bw_final, structure=struct)
+            sizes_f = np.bincount(lbl_f.ravel())
+            keep_f = sizes_f >= (med_area * 0.30)
+            keep_f[0] = False
+            bw_final = keep_f[lbl_f]
+            lbl_f, num_f = nd.label(bw_final, structure=struct)
+        else:
+            bw_final, lbl_f, num_f = bw_opened, lbl_1, 0
 
     centroids = nd.center_of_mass(lbl_f > 0, lbl_f, range(1, num_f + 1)) if num_f > 0 else []
     return {
