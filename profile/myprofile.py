@@ -6,18 +6,18 @@ import scipy.ndimage as nd
 from PIL import Image
 
 st.set_page_config(
-    page_title="Universal Auto Object Counting (HW#5)",
+    page_title="Scene-Adaptive Object Counting (HW#5)",
     layout="wide"
 )
 
-st.title("🤖 범용 완전 자동화 Object Counting 웹 애플리케이션")
+st.title("🧠 장면 인식 기반 멀티 알고리즘 Object Counting 웹 앱")
 st.markdown(
-    "**양방향 극성·다단 임계값 자동 탐색**과 **형상 인식 조건부 HPF + Opening 알고리즘**을 통해 "
-    "작은 객체(낙엽·쌀알), 가방 속 숫자, 키보드 배열, 얇고 긴 객체(면봉), 밀집 동전을 모두 자동으로 판별하여 카운팅합니다."
+    "입력된 이미지의 **배경 구조·타겟 크기·형상(세장비)**을 먼저 진단하여 "
+    "**① 가방 속 숫자(ROI 내부), ② 면봉(교차 세장형), ③ 보도블럭 낙엽(소구경 Top-Hat + MAD), ④ 키보드 격자, ⑤ 입체 블록·동전(HPF + 단위면적 분할)** 중 최적의 알고리즘을 자동으로 다르게 적용합니다."
 )
 
 # ---------------------------------------------------------
-# 1. 기초 유틸리티 함수
+# 1. 공통 유틸리티 및 수학적 기초 함수
 # ---------------------------------------------------------
 def compute_otsu_threshold(arr_uint8):
     if arr_uint8.size == 0:
@@ -49,33 +49,32 @@ def create_disk_structure(radius):
     y, x = np.ogrid[-radius:radius + 1, -radius:radius + 1]
     return (x ** 2 + y ** 2) <= (radius ** 2)
 
-def fill_small_internal_holes(binary, max_hole_px=150):
-    """객체 내부의 아주 작은 반사 구멍만 메우고, 키보드 격자나 배경은 절대 메우지 않음"""
-    inv = ~binary
-    labeled_holes, num_holes = nd.label(inv)
-    if num_holes == 0:
-        return binary
-    hole_sizes = np.bincount(labeled_holes.ravel())
-    border_labels = np.unique(np.concatenate([
-        labeled_holes[0, :], labeled_holes[-1, :],
-        labeled_holes[:, 0], labeled_holes[:, -1]
-    ]))
-    small_holes = hole_sizes <= max_hole_px
-    small_holes[0] = False
-    small_holes[border_labels] = False
-    return binary | small_holes[labeled_holes]
+def resize_keep_aspect(img_pil, max_dim=512):
+    w, h = img_pil.size
+    if max(w, h) <= max_dim:
+        return img_pil
+    scale = max_dim / float(max(w, h))
+    return img_pil.resize((int(round(w * scale)), int(round(h * scale))), Image.Resampling.BILINEAR)
 
-def remove_border_background_slabs(binary):
-    """
-    사진 외곽 테두리(흰 나무 바닥, 노트북 본체 베젤/그림자 등)에 걸친 거대 배경 덩어리를 제거하되,
-    가장자리에 살짝 닿은 정상적인 작은 객체(동전, 쌀알 등)는 보존
-    """
+def fill_small_holes(binary, max_hole_px=200):
+    inv = ~binary
+    lbl, num = nd.label(inv)
+    if num == 0:
+        return binary
+    sizes = np.bincount(lbl.ravel())
+    border_ids = np.unique(np.concatenate([lbl[0, :], lbl[-1, :], lbl[:, 0], lbl[:, -1]]))
+    small = sizes <= max_hole_px
+    small[0] = False
+    small[border_ids] = False
+    return binary | small[lbl]
+
+def remove_border_slabs(binary, max_area_ratio=0.035):
+    """이미지 외곽 테두리에 길게 걸친 배경 덩어리(바닥, 베젤, 큰 그림자) 제거"""
     h, w = binary.shape
     struct = nd.generate_binary_structure(2, 2)
     lbl, num = nd.label(binary, structure=struct)
     if num == 0:
         return binary
-
     sizes = np.bincount(lbl.ravel())
     top_ids = set(np.unique(lbl[0, :])) - {0}
     bot_ids = set(np.unique(lbl[-1, :])) - {0}
@@ -83,15 +82,14 @@ def remove_border_background_slabs(binary):
     right_ids = set(np.unique(lbl[:, -1])) - {0}
     border_ids = top_ids | bot_ids | left_ids | right_ids
 
-    border_mask = np.zeros_like(binary, dtype=bool)
-    border_mask[0, :] = border_mask[-1, :] = border_mask[:, 0] = border_mask[:, -1] = True
-    border_counts = np.bincount(lbl[border_mask].ravel(), minlength=num + 1)
+    b_mask = np.zeros_like(binary, dtype=bool)
+    b_mask[0, :] = b_mask[-1, :] = b_mask[:, 0] = b_mask[:, -1] = True
+    b_counts = np.bincount(lbl[b_mask].ravel(), minlength=num + 1)
 
     remove_ids = []
     for bid in border_ids:
-        sides_touched = sum([bid in top_ids, bid in bot_ids, bid in left_ids, bid in right_ids])
-        # 2개 이상의 외곽 변에 동시에 닿거나, 테두리 접촉 길이가 길거나, 화면의 3.5% 이상을 차지하는 외곽 덩어리는 배경으로 제거
-        if sides_touched >= 2 or border_counts[bid] > max(h, w) * 0.12 or sizes[bid] > (h * w * 0.035):
+        sides = sum([bid in top_ids, bid in bot_ids, bid in left_ids, bid in right_ids])
+        if sides >= 2 or b_counts[bid] > max(h, w) * 0.10 or sizes[bid] > (h * w * max_area_ratio):
             remove_ids.append(bid)
 
     if remove_ids:
@@ -101,324 +99,455 @@ def remove_border_background_slabs(binary):
         return keep[lbl]
     return binary
 
-def resize_keep_aspect(img_pil, max_dim=512):
-    w, h = img_pil.size
-    if max(w, h) <= max_dim:
-        return img_pil
-    scale = max_dim / float(max(w, h))
-    return img_pil.resize((int(round(w * scale)), int(round(h * scale))), Image.Resampling.BILINEAR)
-
-# ---------------------------------------------------------
-# 2. 배경 조명 추정 및 HPF 에지 추출
-# ---------------------------------------------------------
-def estimate_local_background(f_img, percentile=50, window_scale=75):
-    """
-    - 밝은 타겟 검출 시: percentile=50 (보도블럭 표면, 가방 천 등 중위 표면만 추출해 차감)
-    - 어두운 타겟 검출 시: percentile=88 (키보드 은색 격자, 동전 사이 흰 배경 등 상위 배경 포락선 추출)
-    """
-    h, w = f_img.shape
-    step = 4
-    f_small = f_img[::step, ::step]
-    win_s = max(11, int(round(window_scale / step)))
-    if win_s % 2 == 0:
-        win_s += 1
-
-    bg_small = nd.percentile_filter(f_small, percentile=percentile, size=win_s)
-    bg_small = nd.gaussian_filter(bg_small, sigma=win_s * 0.25)
-    bg_pil = Image.fromarray(bg_small.astype(np.float32)).resize((w, h), Image.Resampling.BILINEAR)
-    return np.array(bg_pil, dtype=np.float64)
-
-def extract_hpf_edges(f_norm):
-    """Sobel 경계와 Laplacian 골짜기(인접 객체가 맞닿은 오목한 경계)를 결합한 HPF 맵 생성"""
-    f_s = nd.gaussian_filter(f_norm.astype(np.float64), sigma=1.0)
-
+def extract_hpf_edges(f_img):
+    """Sobel 1차 미분 에지와 Laplacian 2차 미분 골짜기(Valley) 결합"""
+    f_s = nd.gaussian_filter(f_img.astype(np.float64), sigma=1.0)
     gx = nd.sobel(f_s, axis=1)
     gy = nd.sobel(f_s, axis=0)
-    sobel_mag = np.hypot(gx, gy)
-    s99 = np.percentile(sobel_mag, 99.0)
-    sobel_norm = np.clip(sobel_mag / (s99 + 1e-6) * 255.0, 0, 255)
+    sobel = np.hypot(gx, gy)
+    s99 = np.percentile(sobel, 99.0)
+    sobel_norm = np.clip(sobel / (s99 + 1e-6) * 255.0, 0, 255)
 
-    lap_kernel = np.array([[-1, -1, -1],
-                           [-1,  8, -1],
-                           [-1, -1, -1]], dtype=np.float64)
-    lap_resp = signal.convolve2d(f_s, lap_kernel, mode="same", boundary="symm")
-    # 두 밝은 객체 사이의 어두운 골짜기(음의 라플라시안) 추출
-    valley = np.clip(-lap_resp, 0, None)
+    lap_k = np.array([[-1, -1, -1], [-1, 8, -1], [-1, -1, -1]], dtype=np.float64)
+    lap = signal.convolve2d(f_s, lap_k, mode="same", boundary="symm")
+    valley = np.clip(-lap, 0, None)
     v99 = np.percentile(valley, 99.0)
     valley_norm = np.clip(valley / (v99 + 1e-6) * 255.0, 0, 255)
 
-    edge_map = np.clip(0.5 * sobel_norm + 0.5 * valley_norm, 0, 255).astype(np.uint8)
+    edge_map = np.clip(0.55 * sobel_norm + 0.45 * valley_norm, 0, 255).astype(np.uint8)
     return edge_map, valley_norm.astype(np.uint8)
 
 # ---------------------------------------------------------
-# 3. 형상 인식 조건부 HPF + Opening + 선별 분할기
+# 2. 단위 면적(Unit Area) 기반 겹친 객체 강제 분할 알고리즘
+#    (겹친 블록 image_95cce0, 교차 면봉 image_95cd9f, 밀집 동전 해결 핵심)
 # ---------------------------------------------------------
-def refine_and_split_mask(binary_raw, f_norm, edge_map, valley_map, hpf_weight=0.5, force_open_r=None):
-    struct = nd.generate_binary_structure(2, 2)
-    # 1) 외곽에 걸친 대형 배경/프레임(가방 주변 바닥, 노트북 하단 그림자 등) 우선 제거
-    binary = remove_border_background_slabs(binary_raw)
-
-    # 아주 작은 점 잡음(6px 미만) 1차 제거
-    lbl_0, n_0 = nd.label(binary, structure=struct)
-    if n_0 == 0:
-        return binary, 0, 0.0, 1, "객체 없음"
-    sizes_0 = np.bincount(lbl_0.ravel())
-    keep_0 = sizes_0 >= 6
-    keep_0[0] = False
-    binary = keep_0[lbl_0]
-
-    # 2) 객체 형상(두께 R_obj 및 세장비 Elongation) 분석
-    edt_0 = nd.distance_transform_edt(binary)
-    lbl_1, n_1 = nd.label(binary, structure=struct)
-    if n_1 == 0:
-        return binary, 0, 0.0, 1, "객체 없음"
-
-    comp_areas = np.bincount(lbl_1.ravel())[1:]
-    comp_max_r = nd.maximum(edt_0, lbl_1, index=range(1, n_1 + 1))
-    r_obj = float(np.median(comp_max_r)) if len(comp_max_r) > 0 else 4.0
-    r_obj = float(np.clip(r_obj, 1.5, 45.0))
-
-    # 세장비(Elongation): 원형은 Area / (pi * R^2) ≈ 1.0~2.2, 면봉처럼 가늘고 긴 객체는 > 2.8
-    elongation_ratios = comp_areas / (np.pi * (np.maximum(comp_max_r, 1.0) ** 2))
-    median_elongation = float(np.median(elongation_ratios))
-
-    # 형상 분류:
-    # - 세장형(면봉 등): median_elongation > 2.7
-    # - 미세/획 타겟(가방 숫자, 작은 낙엽 등): r_obj <= 4.2
-    # - 일반/밀집 블록·원형(동전, 키보드 자판, 블록 등): 그 외
-    is_elongated = bool(median_elongation > 2.7)
-    is_thin_stroke = bool(r_obj <= 4.2)
-
-    if is_elongated:
-        shape_type = "세장형 (면봉·막대 등)"
-        open_r = 1 if r_obj >= 2.8 else 0
-    elif is_thin_stroke:
-        shape_type = "미세·선형 (숫자·작은 낙엽 등)"
-        open_r = 1 if r_obj >= 2.5 else 0
-    else:
-        shape_type = "블록·원형 (동전·자판·블록 등)"
-        open_r = int(np.clip(round(r_obj * 0.25), 1, 3))
-
-    if force_open_r is not None:
-        open_r = force_open_r
-
-    # 3) 블록·원형 객체일 경우 접합부(Neck)에 HPF 골짜기 차감 및 내부 미세 구멍 메우기
-    if not is_elongated and not is_thin_stroke:
-        binary = fill_small_internal_holes(binary, max_hole_px=int(np.pi * (r_obj ** 2) * 0.35))
-        edt_solid = nd.distance_transform_edt(binary)
-        # 중심부는 보호하고 외곽 접합부(0 < edt <= 0.55 * r_obj)에서만 강한 HPF 골짜기 절단
-        neck_zone = (edt_solid > 0) & (edt_solid <= r_obj * 0.55)
-        cut_line = (valley_map > np.percentile(valley_map, 86)) & neck_zone & (hpf_weight > 0.1)
-        binary = binary & (~cut_line)
-
-    # 4) 형상 맞춤 Morphological Opening 수행
-    if open_r > 0:
-        binary_opened = nd.binary_opening(binary, structure=create_disk_structure(open_r), iterations=1)
-    else:
-        binary_opened = binary.copy()
-
-    binary_opened = remove_border_background_slabs(binary_opened)
-
-    # 5) 복합 덩어리 선별 분할 (Selective Clump Watershed)
-    # 면봉이나 가방 숫자는 쪼개지지 않도록 건너뛰고, 둥근 객체가 1.55배 이상 뭉친 덩어리만 분할
-    lbl_2, n_2 = nd.label(binary_opened, structure=struct)
-    if not is_elongated and not is_thin_stroke and n_2 >= 3:
-        sizes_2 = np.bincount(lbl_2.ravel())[1:]
-        med_area_2 = float(np.median(sizes_2))
-        clump_ids = [i + 1 for i, s in enumerate(sizes_2) if s > med_area_2 * 1.55]
-
-        if len(clump_ids) > 0:
-            clump_mask = np.isin(lbl_2, clump_ids)
-            # 스페이스바처럼 두께가 얇고 균일한 직사각형 단일 키는 분할에서 제외
-            dist_all = nd.distance_transform_edt(binary_opened)
-            edge_pen = np.clip(edge_map.astype(np.float64) / 255.0, 0, 1)
-            dist_guided = dist_all * (1.0 - 0.35 * hpf_weight * edge_pen)
-            dist_smooth = nd.gaussian_filter(dist_guided, sigma=max(1.0, r_obj * 0.22))
-
-            seed_fp = max(5, int(round(r_obj * 1.3)))
-            local_max = (dist_smooth == nd.maximum_filter(dist_smooth, size=seed_fp)) & (dist_all > r_obj * 0.42)
-            local_max = nd.binary_dilation(local_max, structure=create_disk_structure(max(1, int(r_obj * 0.18))))
-            markers, num_seeds = nd.label(local_max, structure=struct)
-
-            if num_seeds > 1:
-                markers_ws = markers.astype(np.int32)
-                markers_ws[~binary_opened] = num_seeds + 1
-                cost = (255 - np.clip(dist_smooth / (dist_smooth.max() + 1e-6) * 255.0, 0, 255)).astype(np.uint8)
-                ws = nd.watershed_ift(cost, markers_ws)
-                ws_fg = np.where((ws >= 1) & (ws <= num_seeds), ws, 0)
-                max_nb = nd.maximum_filter(ws_fg, size=3)
-                min_nb = nd.minimum_filter(np.where(ws_fg > 0, ws_fg, num_seeds + 2), size=3)
-                ridge = (ws_fg > 0) & (max_nb != min_nb) & clump_mask
-                binary_opened = binary_opened & (~ridge)
-
-    # 6) 최종 면적 이상치(잔잡음 및 비정상 거대 배경 덩어리) 필터링
-    lbl_3, n_3 = nd.label(binary_opened, structure=struct)
-    if n_3 == 0:
-        return binary_opened, 0, r_obj, open_r, shape_type
-
-    sizes_3 = np.bincount(lbl_3.ravel())
-    fg_3 = sizes_3[1:]
-    min_abs = max(8, int(binary_opened.size * 0.00018))
-    valid_fg = fg_3[fg_3 >= min_abs]
-    if len(valid_fg) == 0:
-        return np.zeros_like(binary_opened), 0, r_obj, open_r, shape_type
-
-    med_area = float(np.median(valid_fg))
-    min_allow = max(min_abs, med_area * 0.18)
-    # 중앙값 면적의 9.5배를 넘는 거대 배경 그림자나 프레임 덩어리 배제 (스페이스바 등은 ~5배이므로 통과)
-    max_allow = max(med_area * 9.5, binary_opened.size * 0.08)
-
-    keep_final = (sizes_3 >= min_allow) & (sizes_3 <= max_allow)
-    keep_final[0] = False
-    binary_final = keep_final[lbl_3]
-    _, final_count = nd.label(binary_final, structure=struct)
-
-    return binary_final, final_count, r_obj, open_r, shape_type
-
-# ---------------------------------------------------------
-# 4. 후보 분할 품질 자동 평가 함수 (Target Plausibility Score)
-# ---------------------------------------------------------
-def score_candidate_mask(binary_final, f_norm):
+def split_clumps_by_unit_area(binary, edge_map, unit_area, unit_radius, clump_ratio=1.48):
     """
-    검출된 객체들의 면적 규칙성, 배경 범람 여부, 밀실도(보도블럭 금/그물망 배제), 경계 대비를 종합 평가
+    단일 객체 기준 면적(unit_area)보다 1.48배 이상 큰 덩어리(겹친 블록, 교차된 면봉 등)를 찾아,
+    덩어리 면적 / 기준 면적 = K 개로 HPF 에지 및 거리 피크를 따라 정확히 분할합니다.
+    (단일 블록은 K=1이므로 절대 쪼개지지 않습니다.)
     """
     struct = nd.generate_binary_structure(2, 2)
-    lbl, count = nd.label(binary_final, structure=struct)
-    if count < 2 or count > 450:
-        return -1e6 if count == 0 else -500.0
+    lbl, num = nd.label(binary, structure=struct)
+    if num == 0 or unit_area <= 10:
+        return binary
 
-    fg_ratio = float(np.mean(binary_final))
-    # 화면의 55% 이상이 하얗게 덮이면 배경이 범람한 것(예: 보도블럭 전체가 잡힌 경우)이므로 큰 감점
-    if fg_ratio > 0.55 or fg_ratio < 0.001:
-        return -300.0
-
-    sizes = np.bincount(lbl.ravel())[1:].astype(np.float64)
-    med_area = np.median(sizes)
-
-    # 1) 면적 균일도 점수 (규칙적인 타겟일수록 중앙값 주변에 밀집)
-    inliers = np.mean((sizes >= med_area * 0.30) & (sizes <= med_area * 3.2))
-    log_std = np.std(np.log1p(sizes))
-    uniformity_score = (inliers * 45.0) / (1.0 + 0.6 * log_std)
-
-    # 2) 형태 충실도(Bounding Box 대비 채움 비율): 보도블럭 균열 같은 거미줄 형태는 점수가 매우 낮음
+    sizes = np.bincount(lbl.ravel())
     slices = nd.find_objects(lbl)
-    fill_ratios = []
-    for idx, sl in enumerate(slices):
-        if sl is None:
+    output_bw = binary.copy()
+
+    for cid in range(1, num + 1):
+        c_area = sizes[cid]
+        if c_area <= unit_area * clump_ratio:
             continue
-        box_h = sl[0].stop - sl[0].start
-        box_w = sl[1].stop - sl[1].start
-        box_area = max(1, box_h * box_w)
-        fill_ratios.append(sizes[idx] / box_area)
-    med_fill = float(np.median(fill_ratios)) if fill_ratios else 0.1
-    # 너무 텅 빈 거미줄(균열, 격자 테두리) 감점
-    shape_score = 25.0 * med_fill if med_fill >= 0.18 else -80.0
 
-    # 3) 전경-배경 명암 대비 점수
-    dilated = nd.binary_dilation(binary_final, iterations=2)
-    ring = dilated & (~binary_final)
-    contrast = float(np.mean(f_norm[binary_final]) - np.mean(f_norm[ring])) if np.any(ring) else 0.0
-    contrast_score = np.clip(contrast * 0.35, 0.0, 35.0)
+        # 이 덩어리 안에 몇 개의 객체가 뭉쳐 있는지 계산
+        k_targets = int(np.clip(round(c_area / unit_area), 2, 30))
+        sl = slices[cid - 1]
+        # 패딩을 주어 슬라이스 추출
+        y0, y1 = max(0, sl[0].start - 2), min(binary.shape[0], sl[0].stop + 2)
+        x0, x1 = max(0, sl[1].start - 2), min(binary.shape[1], sl[1].stop + 2)
 
-    # 4) 적정 객체 수 가산점 (3개 ~ 180개 사이 선호)
-    count_bonus = 15.0 if 4 <= count <= 180 else 5.0
+        sub_mask = (lbl[y0:y1, x0:x1] == cid)
+        sub_edge = edge_map[y0:y1, x0:x1].astype(np.float64) / 255.0
 
-    return uniformity_score + shape_score + contrast_score + count_bonus
+        # 거리 변환 + HPF 내부 에지 페널티 결합 (블록 경계선에서 값이 낮아지도록 유도)
+        edt = nd.distance_transform_edt(sub_mask)
+        score_map = edt * (1.0 - 0.50 * sub_edge)
+        score_smooth = nd.gaussian_filter(score_map, sigma=max(0.8, unit_radius * 0.18))
+        score_smooth[~sub_mask] = 0.0
+
+        # Greedy Peak Picking: 최소 이격 거리(r_sep)를 유지하며 K개의 중심 시드 추출
+        seeds = []
+        r_sep = max(3.0, unit_radius * 0.72)
+        temp_score = score_smooth.copy()
+
+        for _ in range(k_targets):
+            max_idx = np.argmax(temp_score)
+            yy, xx = np.unravel_index(max_idx, temp_score.shape)
+            if temp_score[yy, xx] <= 0:
+                break
+            seeds.append((yy, xx))
+            # 선택된 시드 주변 r_sep 반경 영점 처리
+            Y, X = np.ogrid[:temp_score.shape[0], :temp_score.shape[1]]
+            dist_sq = (Y - yy) ** 2 + (X - xx) ** 2
+            temp_score[dist_sq <= (r_sep ** 2)] = 0.0
+
+        # 만약 겹침이 심해 시드가 부족하면 이격 거리를 좁혀 나머지 시드 보충
+        if len(seeds) < k_targets:
+            temp_score2 = score_smooth.copy()
+            r_sep_small = max(2.0, unit_radius * 0.42)
+            for sy, sx in seeds:
+                Y, X = np.ogrid[:temp_score2.shape[0], :temp_score2.shape[1]]
+                temp_score2[((Y - sy) ** 2 + (X - sx) ** 2) <= (r_sep_small ** 2)] = 0.0
+            while len(seeds) < k_targets:
+                max_idx = np.argmax(temp_score2)
+                yy, xx = np.unravel_index(max_idx, temp_score2.shape)
+                if temp_score2[yy, xx] <= 0:
+                    break
+                seeds.append((yy, xx))
+                Y, X = np.ogrid[:temp_score2.shape[0], :temp_score2.shape[1]]
+                temp_score2[((Y - yy) ** 2 + (X - sx) ** 2) <= (r_sep_small ** 2)] = 0.0
+
+        if len(seeds) >= 2:
+            markers = np.zeros(sub_mask.shape, dtype=np.int32)
+            for s_idx, (sy, sx) in enumerate(seeds, start=1):
+                markers[sy, sx] = s_idx
+            markers = nd.grey_dilation(markers, size=(3, 3))
+            markers[~sub_mask] = len(seeds) + 1
+
+            # HPF 에지가 높은 곳을 높은 언덕(Cost)으로 설정하여 블록 테두리를 따라 분할 유도
+            inv_dist = 255.0 - np.clip(score_smooth / (score_smooth.max() + 1e-6) * 200.0, 0, 200)
+            cost = np.clip(inv_dist + sub_edge * 55.0, 0, 255).astype(np.uint8)
+            ws = nd.watershed_ift(cost, markers)
+            ws_fg = np.where((ws >= 1) & (ws <= len(seeds)), ws, 0)
+
+            # 서로 다른 시드 영역이 맞닿는 경계선(Ridge) 1픽셀 절단
+            max_nb = nd.maximum_filter(ws_fg, size=3)
+            min_nb = nd.minimum_filter(np.where(ws_fg > 0, ws_fg, len(seeds) + 2), size=3)
+            ridge = (ws_fg > 0) & (max_nb != min_nb)
+
+            sub_out = output_bw[y0:y1, x0:x1]
+            sub_out[ridge] = False
+            output_bw[y0:y1, x0:x1] = sub_out
+
+    return output_bw
 
 # ---------------------------------------------------------
-# 5. 메인 자동화 파이프라인 (4대 후보 모드 탐색 및 최적 결과 반환)
+# 3. 5가지 장면별 전용 알고리즘 파이프라인
 # ---------------------------------------------------------
-def process_image_universal(img_pil, mode_choice="자동 최적 탐색 (Auto)", manual_params=None):
+
+# [알고리즘 1] 컨테이너 내부 ROI 타겟 (예: 흰 바닥 위 검은 가방 속 흰 숫자 - image_95d066)
+def pipeline_container_roi(f_raw, f_denoised, params_override=None):
+    otsu_g = compute_otsu_threshold(f_denoised.astype(np.uint8))
+    dark_mask = f_denoised < (otsu_g * 0.95)
+    dark_mask = remove_border_slabs(dark_mask, max_area_ratio=0.15)
+
+    # 가장 큰 어두운 객체(가방 본체) 추출 후 내부 구멍 메우기
+    lbl_d, num_d = nd.label(dark_mask)
+    if num_d > 0:
+        sizes_d = np.bincount(lbl_d.ravel())
+        sizes_d[0] = 0
+        bag_id = np.argmax(sizes_d)
+        bag_hull = nd.binary_fill_holes(lbl_d == bag_id)
+        # 핵심: 큰 반경 Opening(R=8)과 Erosion(R=6)으로 가방 어깨끈과 외곽 테두리 흰 바닥 유입을 100% 차단!
+        bag_roi = nd.binary_opening(bag_hull, structure=create_disk_structure(8))
+        bag_roi = nd.binary_erosion(bag_roi, structure=create_disk_structure(6))
+    else:
+        bag_roi = np.ones_like(f_denoised, dtype=bool)
+
+    # 가방 내부에서 밝은 숫자만 추출
+    bg_local = nd.percentile_filter(f_denoised, percentile=30, size=25)
+    f_diff = np.clip(f_denoised - bg_local, 0, None)
+    f_diff[~bag_roi] = 0.0  # 가방 본체 바깥은 완벽히 0으로 마스킹
+
+    p99 = np.percentile(f_diff, 99.5)
+    f_norm = np.clip(f_diff / (p99 + 1e-6) * 255.0, 0, 255).astype(np.uint8)
+    edge_map, _ = extract_hpf_edges(f_norm)
+
+    t_val = max(45, compute_otsu_threshold(f_norm[bag_roi]) if np.any(bag_roi) else 80)
+    if params_override:
+        t_val = int(np.clip(t_val + params_override["t_offset"], 10, 245))
+
+    bw = (f_norm > t_val) & bag_roi
+    # 숫자 획 보존을 위해 아주 약한 Opening만 수행
+    open_r = params_override["open_r"] if params_override else 0
+    if open_r > 0:
+        bw = nd.binary_opening(bw, structure=create_disk_structure(open_r))
+
+    struct = nd.generate_binary_structure(2, 2)
+    lbl, num = nd.label(bw, structure=struct)
+    if num > 0:
+        sizes = np.bincount(lbl.ravel())
+        med_a = np.median(sizes[1:])
+        keep = (sizes >= max(12, med_a * 0.22)) & (sizes <= med_a * 4.0)
+        keep[0] = False
+        bw = keep[lbl]
+
+    return f_norm, edge_map, bw, t_val, open_r, False, "알고리즘 1: 내부 컨테이너 ROI (가방 속 숫자 모드)"
+
+
+# [알고리즘 2] 어두운 배경 위 세장형/교차 객체 및 밝은 입자 (예: 면봉 image_95cd9f, 쌀알 rice.tif)
+def pipeline_dark_bg_elongated(f_raw, f_denoised, params_override=None):
+    # 어두운 배경이므로 명암 반전 절대 금지! 넓은 배경만 완만하게 차감하여 교차부 할로(Halo) 방지
+    bg_wide = nd.percentile_filter(f_denoised, percentile=20, size=45)
+    bg_wide = nd.gaussian_filter(bg_wide, sigma=15.0)
+    f_diff = np.clip(f_denoised - bg_wide, 0, None)
+
+    p99 = np.percentile(f_diff, 99.5)
+    f_norm = np.clip(f_diff / (p99 + 1e-6) * 255.0, 0, 255).astype(np.uint8)
+    edge_map, valley_map = extract_hpf_edges(f_norm)
+
+    otsu_t = compute_otsu_threshold(f_norm)
+    t_val = max(35, int(otsu_t * 0.82))
+    if params_override:
+        t_val = int(np.clip(otsu_t + params_override["t_offset"], 10, 245))
+
+    bw = f_norm > t_val
+    bw = fill_small_holes(bw, max_hole_px=40)
+
+    # 나란히 붙은 면봉 사이 골짜기(Valley) 절단
+    edt = nd.distance_transform_edt(bw)
+    r_med = float(np.percentile(edt[edt > 0], 80)) if np.any(edt > 0) else 3.0
+    neck_cut = (valley_map > np.percentile(valley_map, 88)) & (edt > 0) & (edt <= max(2.2, r_med * 0.6))
+    bw_cut = bw & (~neck_cut)
+
+    open_r = params_override["open_r"] if params_override else 1
+    if open_r > 0:
+        bw_cut = nd.binary_opening(bw_cut, structure=create_disk_structure(open_r))
+
+    # 단일 면봉/입자의 기준 면적 산출 후 X자 교차 면봉 및 붙은 면봉 분할
+    struct = nd.generate_binary_structure(2, 2)
+    lbl, num = nd.label(bw_cut, structure=struct)
+    if num > 0:
+        sizes = np.bincount(lbl.ravel())[1:]
+        valid_s = sizes[sizes >= 15]
+        if len(valid_s) > 0:
+            # 하위 65% 백분위수로 '단일 면봉 1개'의 면적 추정
+            unit_area = float(np.percentile(valid_s, 55))
+            bw_split = split_clumps_by_unit_area(bw_cut, edge_map, unit_area, r_med, clump_ratio=1.42)
+            lbl2, num2 = nd.label(bw_split, structure=struct)
+            sizes2 = np.bincount(lbl2.ravel())
+            keep = sizes2 >= max(12, unit_area * 0.28)
+            keep[0] = False
+            bw_cut = keep[lbl2]
+
+    return f_norm, edge_map, bw_cut, t_val, open_r, False, "알고리즘 2: 어두운 배경 세장형·교차 분할 (면봉·입자 모드)"
+
+
+# [알고리즘 3] 텍스처 바닥 위 소형 산재 타겟 (예: 보도블럭·아스팔트 위 낙엽 3종 - image_95cd41, 95c9da, 95c99b)
+def pipeline_textured_small_targets(f_raw, f_denoised, params_override=None):
+    # 핵심 1: 소구경(17x17) 중위 필터와 White Top-Hat을 결합하여
+    # 밝은 보도블럭 타일(image_95c99b)과 검은 줄눈을 동시에 제거하고 작은 낙엽만 추출!
+    bg_local_med = nd.percentile_filter(f_denoised, percentile=55, size=17)
+    bg_tophat = nd.grey_opening(f_denoised, size=(15, 15))
+    f_tophat = np.minimum(
+        np.clip(f_denoised - bg_local_med, 0, None),
+        np.clip(f_denoised - bg_tophat, 0, None)
+    )
+    # 아스팔트의 미세한 점 잡음 스무딩
+    f_tophat = nd.gaussian_filter(f_tophat, sigma=0.9)
+
+    p995 = np.percentile(f_tophat, 99.6)
+    f_norm_lin = np.clip(f_tophat / (p995 + 1e-6) * 255.0, 0, 255)
+    # 감마 보정(0.75)으로 어두운 낙엽(image_95c9da)과 멀리 있는 작은 낙엽(image_95cd41, 95c99b) 밝기 부스트
+    f_norm = np.clip(((f_norm_lin / 255.0) ** 0.75) * 255.0, 0, 255).astype(np.uint8)
+    edge_map, _ = extract_hpf_edges(f_norm)
+
+    # 핵심 2: 2단 Otsu(T=178) 대신 배경의 MAD(중앙절대편차) 기반 통계적 임계값 사용!
+    med_v = float(np.median(f_norm))
+    mad_v = float(np.median(np.abs(f_norm.astype(np.float64) - med_v))) + 1.0
+    t_val = int(np.clip(med_v + 4.2 * mad_v, 36, 82))
+    if params_override:
+        t_val = int(np.clip(t_val + params_override["t_offset"], 10, 245))
+
+    bw = f_norm > t_val
+    open_r = params_override["open_r"] if params_override else 0
+    if open_r > 0:
+        bw = nd.binary_opening(bw, structure=create_disk_structure(open_r))
+
+    # 핵심 3: 원근감을 고려하여 사진 위쪽 멀리 있는 작은 낙엽(최소 5px)까지 카운팅에 포함
+    struct = nd.generate_binary_structure(2, 2)
+    lbl, num = nd.label(bw, structure=struct)
+    if num > 0:
+        sizes = np.bincount(lbl.ravel())
+        # 각 컴포넌트 내부의 최대 밝기가 충분히 뚜렷한 경우 5px 이상 모두 보존
+        max_intensities = nd.maximum(f_norm, lbl, index=range(1, num + 1))
+        keep = np.zeros(num + 1, dtype=bool)
+        for i in range(1, num + 1):
+            if (sizes[i] >= 5 and max_intensities[i - 1] >= t_val + 14) or sizes[i] >= 11:
+                if sizes[i] <= (bw.size * 0.02):  # 거대 보도블럭 잔상 배제
+                    keep[i] = True
+        bw = keep[lbl]
+
+    return f_norm, edge_map, bw, t_val, open_r, False, "알고리즘 3: 소구경 Top-Hat + MAD 통계 검출 (낙엽·소형 타겟 모드)"
+
+
+# [알고리즘 4] 격자 배열 타겟 (예: 키보드 자판 - image_963d62)
+def pipeline_grid_array(f_raw, f_denoised, params_override=None):
+    bg_bright = nd.percentile_filter(f_denoised, percentile=88, size=45)
+    bg_bright = nd.gaussian_filter(bg_bright, sigma=8.0)
+    f_diff = np.clip(bg_bright - f_denoised, 0, None)
+
+    p99 = np.percentile(f_diff, 99.5)
+    f_norm = np.clip(f_diff / (p99 + 1e-6) * 255.0, 0, 255).astype(np.uint8)
+    edge_map, valley_map = extract_hpf_edges(f_norm)
+
+    otsu_t = compute_otsu_threshold(f_norm)
+    t_val = int(np.clip(otsu_t * 1.05, 70, 160))
+    if params_override:
+        t_val = int(np.clip(otsu_t + params_override["t_offset"], 10, 245))
+
+    # 자판 사이의 은색 격자선(Valley)을 강하게 절단
+    f_cut = np.clip(f_norm.astype(np.float64) - 0.65 * valley_map.astype(np.float64), 0, 255)
+    bw = f_cut > t_val
+    bw = remove_border_slabs(bw, max_area_ratio=0.03)
+
+    open_r = params_override["open_r"] if params_override else 2
+    if open_r > 0:
+        bw = nd.binary_opening(bw, structure=create_disk_structure(open_r))
+    bw = fill_small_holes(bw, max_hole_px=80)
+
+    struct = nd.generate_binary_structure(2, 2)
+    lbl, num = nd.label(bw, structure=struct)
+    if num > 0:
+        sizes = np.bincount(lbl.ravel())
+        med_a = float(np.median(sizes[1:]))
+        keep = (sizes >= max(20, med_a * 0.25)) & (sizes <= med_a * 7.5)
+        keep[0] = False
+        bw = keep[lbl]
+
+    return f_norm, edge_map, bw, t_val, open_r, True, "알고리즘 4: HPF 격자 절단 + 그림자 배제 (키보드·배열 모드)"
+
+
+# [알고리즘 5] 밝은 배경 위 입체 블록·동전 및 겹친 군집 (예: 겹친 블록 image_95cce0, 20개 블록 95c93b, 동전 IMG_9637)
+def pipeline_solid_blocks_and_coins(f_raw, f_denoised, params_override=None):
+    # 대구경 상위 백분위수(90%) 포락선으로 흰 종이/바닥의 조명 그라데이션 추정
+    h, w = f_denoised.shape
+    f_small = f_denoised[::4, ::4]
+    bg_s = nd.percentile_filter(f_small, percentile=90, size=25)
+    bg_s = nd.gaussian_filter(bg_s, sigma=6.0)
+    bg_full = np.array(Image.fromarray(bg_s.astype(np.float32)).resize((w, h), Image.Resampling.BILINEAR), dtype=np.float64)
+
+    f_diff = np.clip(bg_full - f_denoised, 0, None)
+    p99 = np.percentile(f_diff, 99.5)
+    f_norm = np.clip(f_diff / (p99 + 1e-6) * 255.0, 0, 255).astype(np.uint8)
+    edge_map, valley_map = extract_hpf_edges(f_norm)
+
+    otsu_t = compute_otsu_threshold(f_norm)
+    # 블록 주변의 옅은 그림자가 붙지 않도록 임계값 설정
+    t_val = int(np.clip(otsu_t * 0.88, 55, 135))
+    if params_override:
+        t_val = int(np.clip(otsu_t + params_override["t_offset"], 10, 245))
+
+    bw = f_norm > t_val
+    bw = remove_border_slabs(bw, max_area_ratio=0.05)
+    bw = fill_small_holes(bw, max_hole_px=120)
+
+    # 초기 반경 측정
+    edt = nd.distance_transform_edt(bw)
+    peaks = (edt == nd.maximum_filter(edt, size=9)) & (edt > 3.0)
+    r_unit = float(np.median(edt[peaks])) if np.any(peaks) else 10.0
+    r_unit = float(np.clip(r_unit, 4.0, 35.0))
+
+    # 접합부(Neck)에 HPF 골짜기 차감 후 Opening 수행
+    neck_zone = (edt > 0) & (edt <= r_unit * 0.55)
+    cut_pixels = (valley_map > np.percentile(valley_map, 85)) & neck_zone
+    bw_carved = bw & (~cut_pixels)
+
+    open_r = params_override["open_r"] if params_override else int(np.clip(round(r_unit * 0.22), 1, 3))
+    if open_r > 0:
+        bw_opened = nd.binary_opening(bw_carved, structure=create_disk_structure(open_r))
+    else:
+        bw_opened = bw_carved.copy()
+    bw_opened = fill_small_holes(bw_opened, max_hole_px=120)
+
+    # 핵심: 외곽의 단일 블록들(하위 25%~65% 면적 분포)로부터 '블록 1개의 기준 면적(unit_area)'을 정확히 계산!
+    struct = nd.generate_binary_structure(2, 2)
+    lbl, num = nd.label(bw_opened, structure=struct)
+    if num > 0:
+        sizes = np.bincount(lbl.ravel())[1:]
+        min_prelim = max(20, int(np.pi * (r_unit ** 2) * 0.22))
+        valid_s = sizes[sizes >= min_prelim]
+
+        if len(valid_s) > 0:
+            # 겹친 거대 덩어리를 제외한 단일 블록들의 중앙값 면적 산출
+            q25, q65 = np.percentile(valid_s, [25, 65])
+            single_candidates = valid_s[(valid_s >= q25) & (valid_s <= q65)]
+            unit_area = float(np.median(single_candidates)) if len(single_candidates) > 0 else float(np.median(valid_s))
+
+            # 1) 겹쳐 있는 중앙 블록 무리(image_95cce0)나 붙은 동전(IMG_9637)을 기준 면적(unit_area) 단위로 강제 분할!
+            #    (20개 단일 블록 사진 image_95c93b는 모든 블록이 1.48 * unit_area 미만이므로 절대 쪼개지지 않음!)
+            bw_split = split_clumps_by_unit_area(bw_opened, edge_map, unit_area, r_unit, clump_ratio=1.48)
+
+            # 2) 단일 블록 면적의 42% 미만인 그림자 파편 제거 (image_95c93b에서 21개로 카운팅되던 그림자 조각 완벽 제거!)
+            lbl_f, num_f = nd.label(bw_split, structure=struct)
+            sizes_f = np.bincount(lbl_f.ravel())
+            keep_f = sizes_f >= (unit_area * 0.42)
+            keep_f[0] = False
+            bw_opened = keep_f[lbl_f]
+
+    return f_norm, edge_map, bw_opened, t_val, open_r, True, "알고리즘 5: HPF + 단위면적 비례 군집 분할 (입체 블록·동전 모드)"
+
+
+# ---------------------------------------------------------
+# 4. 이미지 자동 진단 및 알고리즘 라우터 (Scene Classifier)
+# ---------------------------------------------------------
+def diagnose_and_route(img_pil, selected_pipeline="자동 감지 (Auto Router)", params_override=None):
     gray_full = img_pil.convert("RGB").convert("L")
     gray_resized = resize_keep_aspect(gray_full, max_dim=512)
     f_raw = np.array(gray_resized, dtype=np.float64)
-
-    # 미세 노이즈 제거 (3x3 Median으로 얇은 면봉, 숫자 획, 키보드 틈새 보존)
     f_denoised = signal.medfilt2d(f_raw, kernel_size=3)
 
-    # [후보군 A: 밝은 타겟 모드 (쌀알, 보도블럭 위 낙엽, 검은 가방 위 흰 숫자 등)]
-    bg_dark = estimate_local_background(f_denoised, percentile=50, window_scale=65)
-    f_bright_diff = np.clip(f_denoised - bg_dark, 0, None)
-    p99_b = np.percentile(f_bright_diff, 99.5)
-    f_bright_norm = np.clip(f_bright_diff / (p99_b + 1e-6) * 255.0, 0, 255).astype(np.uint8)
+    h, w = f_denoised.shape
+    pad_h, pad_w = max(2, int(h * 0.04)), max(2, int(w * 0.04))
+    border_pixels = np.concatenate([
+        f_denoised[:pad_h, :].ravel(), f_denoised[-pad_h:, :].ravel(),
+        f_denoised[:, :pad_w].ravel(), f_denoised[:, -pad_w:].ravel()
+    ])
+    border_med = float(np.median(border_pixels))
+    global_med = float(np.median(f_denoised))
+    otsu_g = compute_otsu_threshold(f_denoised.astype(np.uint8))
 
-    # [후보군 B: 어두운 타겟 모드 (밝은 배경 위 블록, 동전, 키보드 자판 등)]
-    bg_bright = estimate_local_background(f_denoised, percentile=88, window_scale=75)
-    f_dark_diff = np.clip(bg_bright - f_denoised, 0, None)
-    p99_d = np.percentile(f_dark_diff, 99.5)
-    f_dark_norm = np.clip(f_dark_diff / (p99_d + 1e-6) * 255.0, 0, 255).astype(np.uint8)
-
-    # 수동 모드일 경우 지정된 설정으로 즉시 실행
-    if manual_params is not None:
-        is_inv = (manual_params["polarity"] == "어두운 타겟 (반전)")
-        f_use = f_dark_norm if is_inv else f_bright_norm
-        edge_map, valley_map = extract_hpf_edges(f_use)
-        t_otsu = compute_otsu_threshold(f_use)
-        t_val = int(np.clip(t_otsu + manual_params["t_offset"], 10, 245))
-        bw_raw = f_use > t_val
-        bw_final, cnt, r_obj, open_r, s_type = refine_and_split_mask(
-            bw_raw, f_use, edge_map, valley_map,
-            hpf_weight=manual_params["hpf_w"],
-            force_open_r=manual_params["open_r"]
-        )
+    # 수동으로 특정 알고리즘을 지정한 경우
+    if selected_pipeline != "자동 감지 (Auto Router)":
+        if "알고리즘 1" in selected_pipeline:
+            res_tuple = pipeline_container_roi(f_raw, f_denoised, params_override)
+        elif "알고리즘 2" in selected_pipeline:
+            res_tuple = pipeline_dark_bg_elongated(f_raw, f_denoised, params_override)
+        elif "알고리즘 3" in selected_pipeline:
+            res_tuple = pipeline_textured_small_targets(f_raw, f_denoised, params_override)
+        elif "알고리즘 4" in selected_pipeline:
+            res_tuple = pipeline_grid_array(f_raw, f_denoised, params_override)
+        else:
+            res_tuple = pipeline_solid_blocks_and_coins(f_raw, f_denoised, params_override)
     else:
-        # 4가지 자동 후보 생성:
-        # 1) 밝은 타겟 (표준 1단 Otsu) - 예: rice.tif, 가방 위 흰 숫자
-        # 2) 밝은 고휘도 타겟 (2단 상위 Otsu) - 예: 회색 보도블럭 위 밝은 낙엽
-        # 3) 어두운 타겟 (표준 1단 Otsu) - 예: 흰 배경 위 블록, 밀집 동전
-        # 4) 어두운 고대비 타겟 (2단 상위 Otsu) - 예: 은색 노트북 위 검은 키보드 자판
-        candidates = []
-        for pol_name, is_inv, f_use in [
-            ("밝은 타겟 (원본 극성)", False, f_bright_norm),
-            ("어두운 타겟 (반전 극성)", True, f_dark_norm)
-        ]:
-            edge_map, valley_map = extract_hpf_edges(f_use)
-            t1 = max(28, compute_otsu_threshold(f_use))
-            upper_pixels = f_use[f_use > t1]
-            t2 = int(np.clip(compute_otsu_threshold(upper_pixels), t1 + 15, 235)) if len(upper_pixels) > 50 else t1 + 25
+        # [자동 진단 1] 어두운 배경 (면봉 image_95cd9f, 쌀알 rice.tif 등)
+        if border_med < 85 and global_med < 95:
+            res_tuple = pipeline_dark_bg_elongated(f_raw, f_denoised, params_override)
 
-            # 동전처럼 밝기 편차가 큰 밀집 객체를 위한 완화 임계값 후보(t0)도 함께 점검
-            t0 = max(25, int(t1 * 0.78))
+        else:
+            # [자동 진단 2] 밝은 외곽 배경 안에 거대 어두운 컨테이너(검은 가방 image_95d066)가 있는지 검사
+            dark_Check = remove_border_slabs(f_denoised < (otsu_g * 0.92), max_area_ratio=0.15)
+            lbl_d, num_d = nd.label(dark_Check)
+            max_dark_ratio = (np.max(np.bincount(lbl_d.ravel())[1:]) / float(h * w)) if num_d > 0 else 0.0
 
-            for t_label, t_cand in [("표준 Otsu", t1), ("고대비 2단 Otsu", t2), ("저대비 포괄 Otsu", t0)]:
-                if mode_choice == "밝은 타겟만 탐색" and is_inv:
-                    continue
-                if mode_choice == "어두운 타겟만 탐색" and not is_inv:
-                    continue
+            is_container_bag = False
+            if border_med > 140 and 0.16 <= max_dark_ratio <= 0.75:
+                bag_id = np.argmax(np.bincount(lbl_d.ravel())[1:]) + 1
+                bag_hull = nd.binary_fill_holes(lbl_d == bag_id)
+                bag_eroded = nd.binary_erosion(bag_hull, structure=create_disk_structure(6))
+                # 가방 내부에 밝은 객체(흰 숫자)들이 독립적으로 존재하는지 확인
+                inner_bright = (f_denoised > otsu_g) & bag_eroded
+                _, n_inner = nd.label(inner_bright)
+                if 5 <= n_inner <= 60 and np.mean(f_denoised[bag_eroded] < otsu_g) > 0.65:
+                    is_container_bag = True
 
-                bw_raw = f_use > t_cand
-                bw_final, cnt, r_obj, open_r, s_type = refine_and_split_mask(
-                    bw_raw, f_use, edge_map, valley_map, hpf_weight=0.55
-                )
-                sc = score_candidate_mask(bw_final, f_use)
-                # 표준 Otsu에 약간의 기본 우선순위 부여 (동점 방지)
-                if t_label == "표준 Otsu":
-                    sc += 4.0
-                candidates.append({
-                    "score": sc,
-                    "pol_name": f"{pol_name} - {t_label}",
-                    "is_inv": is_inv,
-                    "f_use": f_use,
-                    "edge_map": edge_map,
-                    "bw_final": bw_final,
-                    "count": cnt,
-                    "thresh": t_cand,
-                    "r_obj": r_obj,
-                    "open_r": open_r,
-                    "shape_type": s_type
-                })
+            if is_container_bag:
+                res_tuple = pipeline_container_roi(f_raw, f_denoised, params_override)
 
-        # 가장 품질 점수가 높은 후보 자동 선택
-        best = max(candidates, key=lambda x: x["score"])
-        f_use = best["f_use"]
-        edge_map = best["edge_map"]
-        bw_final = best["bw_final"]
-        cnt = best["count"]
-        t_val = best["thresh"]
-        r_obj = best["r_obj"]
-        open_r = best["open_r"]
-        s_type = best["shape_type"]
-        is_inv = best["is_inv"]
+            # [자동 진단 3] 중간 톤 텍스처 바닥 위 소형 산재 타겟 (보도블럭·아스팔트 낙엽 3종)
+            elif border_med < 175 and global_med < 175:
+                res_tuple = pipeline_textured_small_targets(f_raw, f_denoised, params_override)
+
+            # [자동 진단 4 & 5] 밝은 배경 위 어두운 타겟 (키보드 배열 vs 입체 블록·동전)
+            else:
+                # 직사각형 격자 밀집도 검사 (키보드 판별)
+                bw_test = remove_border_slabs(f_denoised < (otsu_g * 0.95))
+                lbl_t, num_t = nd.label(bw_test)
+                rect_fills = []
+                if num_t >= 25:
+                    sizes_t = np.bincount(lbl_t.ravel())[1:]
+                    for idx, sl in enumerate(nd.find_objects(lbl_t)):
+                        if sl is not None and sizes_t[idx] > 40:
+                            ba = (sl[0].stop - sl[0].start) * (sl[1].stop - sl[1].start)
+                            rect_fills.append(sizes_t[idx] / float(max(1, ba)))
+                if len(rect_fills) >= 25 and np.median(rect_fills) > 0.74:
+                    res_tuple = pipeline_grid_array(f_raw, f_denoised, params_override)
+                else:
+                    res_tuple = pipeline_solid_blocks_and_coins(f_raw, f_denoised, params_override)
+
+    f_norm, edge_map, bw_final, t_val, open_r, is_inv, algo_name = res_tuple
 
     struct = nd.generate_binary_structure(2, 2)
     labeled_array, final_count = nd.label(bw_final, structure=struct)
@@ -426,53 +555,44 @@ def process_image_universal(img_pil, mode_choice="자동 최적 탐색 (Auto)", 
 
     return {
         "original_gray": np.array(gray_resized),
-        "corrected": f_use,
+        "corrected": f_norm,
         "edge_map": edge_map,
         "binary_final": bw_final,
         "labeled": labeled_array,
         "count": final_count,
         "centroids": centroids,
         "info": {
+            "algo_name": algo_name,
             "is_inverted": is_inv,
-            "r_obj": round(r_obj, 1),
-            "open_r": open_r,
             "thresh": t_val,
-            "shape_type": s_type
+            "open_r": open_r
         }
     }
 
 # ---------------------------------------------------------
-# 6. 사이드바 UI 구성
+# 5. 사이드바 안내 및 메인 화면 구성
 # ---------------------------------------------------------
-st.sidebar.header("🤖 자동화 모드 설정")
-auto_mode = st.sidebar.toggle("✨ 100% 완전 자동 판별 모드", value=True)
+st.sidebar.header("🧠 멀티 알고리즘 라우터")
+global_router_mode = st.sidebar.selectbox(
+    "기본 알고리즘 선택 방식",
+    [
+        "자동 감지 (Auto Router)",
+        "알고리즘 1: 내부 컨테이너 ROI (가방 숫자)",
+        "알고리즘 2: 어두운 배경 세장형·교차 (면봉·쌀알)",
+        "알고리즘 3: 소구경 Top-Hat + MAD (보도블럭 낙엽)",
+        "알고리즘 4: HPF 격자 절단 (키보드 자판)",
+        "알고리즘 5: 단위면적 비례 군집 분할 (블록·동전)"
+    ]
+)
 
-if auto_mode:
-    mode_filter = st.sidebar.radio(
-        "탐색 범위 설정",
-        ["자동 최적 탐색 (Auto)", "밝은 타겟만 탐색", "어두운 타겟만 탐색"],
-        index=0
-    )
-    manual_params = None
-    st.sidebar.info(
-        "**작동 중인 자동화 기술:**\n"
-        "1. **양방향 극성 & 다단 Otsu 평가**: 가방 속 흰 숫자, 보도블럭 위 낙엽, 키보드 자판 중 실제 타겟 군집을 자동 선택\n"
-        "2. **외곽 배경 자동 소거**: 사진 테두리에 걸친 흰 바닥·노트북 그림자 배제\n"
-        "3. **형상 적응형 Opening**: 면봉·숫자처럼 얇은 타겟은 침식을 최소화(`R=0~1`)하고, 뭉툭한 타겟만 HPF+Opening 분리"
-    )
-else:
-    mode_filter = "수동"
-    st.sidebar.subheader("수동 파라미터 제어")
-    manual_params = {
-        "polarity": st.sidebar.selectbox("타겟 밝기", ["밝은 타겟 (원본)", "어두운 타겟 (반전)"]),
-        "t_offset": st.sidebar.slider("임계값 미세 조정 (Offset)", -60, 60, 0, 2),
-        "hpf_w": st.sidebar.slider("HPF 에지 절단 강도", 0.0, 1.2, 0.5, 0.05),
-        "open_r": st.sidebar.slider("Opening 커널 반경 (R)", 0, 5, 1, 1)
-    }
+st.sidebar.info(
+    "**자동 분기 작동 원리:**\n"
+    "- **가방 숫자**: 가방 본체 내부만 마스킹해 어깨끈·바닥 유입 차단\n"
+    "- **면봉**: 어두운 배경 고정 + 교차된 면봉을 단일 면봉 면적 비례로 분할\n"
+    "- **낙엽**: `17x17` 소구경 Top-Hat으로 밝은 타일 제거 + `MAD` 임계값으로 작은/중간 밝기 낙엽 모두 검출\n"
+    "- **블록·동전**: `42%` 미만 그림자 파편 제거 + 중앙 겹친 블록을 단위 블록 면적($A_{\\text{unit}}$)으로 분할"
+)
 
-# ---------------------------------------------------------
-# 7. 메인 화면: 다중 이미지 업로드 및 결과 출력
-# ---------------------------------------------------------
 uploaded_files = st.file_uploader(
     "카운팅할 이미지 파일들을 업로드하세요 (여러 장 동시 선택 가능)",
     type=["tif", "tiff", "png", "jpg", "jpeg", "bmp"],
@@ -483,53 +603,45 @@ if uploaded_files:
     summary_data = []
     results_list = []
 
-    for uploaded_file in uploaded_files:
+    st.subheader("🖼️ 이미지별 자동 선택 알고리즘 및 5단계 처리 결과")
+    tabs = st.tabs([file.name for file in uploaded_files])
+
+    for idx, (tab, uploaded_file) in enumerate(zip(tabs, uploaded_files)):
         img_pil = Image.open(uploaded_file)
-        res = process_image_universal(img_pil, mode_choice=mode_filter, manual_params=manual_params)
-        results_list.append((uploaded_file.name, img_pil, res))
-        info = res["info"]
 
-        summary_data.append({
-            "파일명": uploaded_file.name,
-            "원본 해상도": f"{img_pil.width} x {img_pil.height}",
-            "검출된 객체 수 (개)": res["count"],
-            "자동 인식 형상": info["shape_type"],
-            "적용 극성": "어두운 타겟 (반전)" if info["is_inverted"] else "밝은 타겟 (원본)",
-            "추정 두께 반경 (px)": info["r_obj"],
-            "자동 Opening (R)": f"R = {info['open_r']}",
-            "선택 임계값 (T)": info["thresh"]
-        })
-
-    st.subheader("📊 전체 이미지 자동 Object Counting 요약")
-    st.dataframe(summary_data, use_container_width=True)
-
-    st.divider()
-    st.subheader("🖼️ 이미지별 5단계 처리 결과 및 자동 인식 정보")
-    tabs = st.tabs([item[0] for item in results_list])
-
-    for idx, (tab, (fname, img_pil, res)) in enumerate(zip(tabs, results_list)):
         with tab:
-            # 특정 탭에서만 수동으로 오버라이드하고 싶을 때 사용할 수 있는 개별 조정창
-            with st.expander("🔧 이 이미지만 수동으로 파라미터 변경하기 (선택 사항)"):
-                col_a, col_b, col_c, col_d = st.columns(4)
-                use_ind = col_a.checkbox("수동 변경 적용", value=False, key=f"ind_{idx}")
-                ind_pol = col_b.selectbox("타겟 극성", ["밝은 타겟 (원본)", "어두운 타겟 (반전)"], key=f"ipol_{idx}", disabled=not use_ind)
-                ind_off = col_c.slider("임계값 Offset", -60, 60, 0, 2, key=f"ioff_{idx}", disabled=not use_ind)
-                ind_rad = col_d.slider("Opening 반경 (R)", 0, 5, 1, 1, key=f"irad_{idx}", disabled=not use_ind)
-
-            if use_ind:
-                res = process_image_universal(
-                    img_pil,
-                    manual_params={"polarity": ind_pol, "t_offset": ind_off, "hpf_w": 0.5, "open_r": ind_rad}
+            with st.expander("🔧 이 이미지의 알고리즘 또는 임계값 수동 변경하기 (선택 사항)"):
+                c_a, c_b, c_c = st.columns(3)
+                ind_pipe = c_a.selectbox(
+                    "적용할 알고리즘 선택",
+                    [
+                        "자동 감지 (Auto Router)",
+                        "알고리즘 1: 내부 컨테이너 ROI (가방 숫자)",
+                        "알고리즘 2: 어두운 배경 세장형·교차 (면봉·쌀알)",
+                        "알고리즘 3: 소구경 Top-Hat + MAD (보도블럭 낙엽)",
+                        "알고리즘 4: HPF 격자 절단 (키보드 자판)",
+                        "알고리즘 5: 단위면적 비례 군집 분할 (블록·동전)"
+                    ],
+                    index=0,
+                    key=f"pipe_{idx}"
                 )
+                use_custom_param = c_b.checkbox("임계값/Opening 수동 미세 조정", value=False, key=f"cust_{idx}")
+                ind_off = c_b.slider("임계값 Offset", -50, 50, 0, 2, key=f"off_{idx}", disabled=not use_custom_param)
+                ind_rad = c_c.slider("Opening 반경 (R)", 0, 5, 1, 1, key=f"rad_{idx}", disabled=not use_custom_param)
 
+            chosen_mode = ind_pipe if ind_pipe != "자동 감지 (Auto Router)" else global_router_mode
+            override = {"t_offset": ind_off, "open_r": ind_rad} if use_custom_param else None
+
+            res = diagnose_and_route(img_pil, selected_pipeline=chosen_mode, params_override=override)
             info = res["info"]
-            c1, c2, c3, c4, c5 = st.columns(5)
-            c1.metric("검출된 총 객체 수", f"{res['count']} 개")
-            c2.metric("인식된 타겟 형태", info["shape_type"])
-            c3.metric("추정 반경 / Opening", f"{info['r_obj']} px / R={info['open_r']}")
-            c4.metric("자동 선택 임계값", f"T = {info['thresh']}")
-            c5.metric("타겟 극성", "어두운 타겟 (반전)" if info["is_inverted"] else "밝은 타겟 (원본)")
+
+            st.success(f"**자동 진단 적용 알고리즘**: `{info['algo_name']}`")
+
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("검출된 총 객체 수", f"{res['count']} 개")
+            m2.metric("적용 임계값 (Threshold)", f"T = {info['thresh']}")
+            m3.metric("적용 Opening 반경", f"R = {info['open_r']}")
+            m4.metric("타겟 극성", "어두운 타겟 (반전)" if info["is_inverted"] else "밝은 타겟 (원본)")
 
             fig, axes = plt.subplots(1, 5, figsize=(20, 4.5))
 
@@ -538,7 +650,7 @@ if uploaded_files:
             axes[0].axis("off")
 
             axes[1].imshow(res["corrected"], cmap="gray")
-            axes[1].set_title("2. Local Surface Bg Sub")
+            axes[1].set_title("2. Scene-Specific Bg Sub")
             axes[1].axis("off")
 
             axes[2].imshow(res["edge_map"], cmap="inferno")
@@ -546,7 +658,7 @@ if uploaded_files:
             axes[2].axis("off")
 
             axes[3].imshow(res["binary_final"], cmap="gray")
-            axes[3].set_title(f"4. Adaptive Open (R={info['open_r']}, T={info['thresh']})")
+            axes[3].set_title(f"4. Segmented (R={info['open_r']}, T={info['thresh']})")
             axes[3].axis("off")
 
             axes[4].imshow(res["labeled"], cmap="nipy_spectral")
@@ -559,5 +671,18 @@ if uploaded_files:
             plt.tight_layout()
             st.pyplot(fig)
             plt.close(fig)
+
+        summary_data.append({
+            "파일명": uploaded_file.name,
+            "원본 해상도": f"{img_pil.width} x {img_pil.height}",
+            "자동 선택된 알고리즘": info["algo_name"],
+            "검출된 객체 수 (개)": res["count"],
+            "적용 임계값 (T)": info["thresh"],
+            "Opening (R)": f"R = {info['open_r']}"
+        })
+
+    st.divider()
+    st.subheader("📊 전체 이미지 자동 Object Counting 요약")
+    st.dataframe(summary_data, use_container_width=True)
 else:
-    st.info("👆 상단의 'Browse files' 버튼을 눌러 이미지들을 업로드하면, 각 이미지의 타겟 형태와 배경을 자동 분석하여 카운팅합니다.")
+    st.info("👆 상단의 'Browse files' 버튼을 눌러 이미지들을 업로드하면, 각 이미지의 장면 특성을 진단하여 최적의 알고리즘을 자동 적용합니다.")
