@@ -675,4 +675,86 @@ if mode == "수동 설정":
     split_opt = st.sidebar.checkbox("붙은 객체 분할", value=True)
 
     manual_cfg = {
-        "invert": invert_opt, "med_k": med_k_opt,
+        "invert": invert_opt, "med_k": med_k_opt, "use_bg": use_bg_opt,
+        "bg_sigma": bg_sig_opt, "hpf_w": hpf_w_opt, "thresh": thresh_opt,
+        "open_r": open_r_opt, "min_area": min_area_opt, "split": split_opt
+    }
+
+uploaded_files = st.file_uploader(
+    "이미지 파일 업로드",
+    type=["tif", "tiff", "png", "jpg", "jpeg", "bmp"],
+    accept_multiple_files=True
+)
+
+if uploaded_files:
+    summary_data = []
+    tabs = st.tabs([file.name for file in uploaded_files])
+
+    for idx, (tab, uploaded_file) in enumerate(zip(tabs, uploaded_files)):
+        img_pil = Image.open(uploaded_file)
+
+        with tab:
+            with st.expander("개별 파라미터 수동 조정"):
+                c1, c2, c3, c4 = st.columns(4)
+                use_ind = c1.checkbox("수동 적용", value=False, key=f"ind_{idx}")
+                ind_inv = c1.checkbox("명암 반전", value=True, key=f"inv_{idx}", disabled=not use_ind)
+                ind_t = c2.slider("임계값 (T)", 5, 250, 75, 1, key=f"t_{idx}", disabled=not use_ind)
+                ind_r = c3.slider("Opening 반경 (R)", 0, 6, 1, 1, key=f"r_{idx}", disabled=not use_ind)
+                ind_min = c4.slider("최소 면적 (px)", 5, 300, 20, 5, key=f"m_{idx}", disabled=not use_ind)
+
+            if use_ind:
+                local_manual = {
+                    "invert": ind_inv, "med_k": 3, "use_bg": True, "bg_sigma": 40.0,
+                    "hpf_w": 0.45, "thresh": ind_t, "open_r": ind_r,
+                    "min_area": ind_min, "split": True
+                }
+                res = process_image(img_pil, manual=local_manual)
+            else:
+                res = process_image(img_pil, manual=manual_cfg)
+
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("검출된 객체 수", f"{res['count']} 개")
+            m2.metric("적용 임계값", f"T = {res['thresh']}")
+            m3.metric("Opening 반경", f"R = {res['open_r']}")
+            m4.metric("명암 반전", "적용됨" if res["is_inverted"] else "원본 유지")
+
+            fig, axes = plt.subplots(1, 5, figsize=(20, 4.5))
+
+            axes[0].imshow(res["original_gray"], cmap="gray")
+            axes[0].set_title("1. Grayscale Input")
+            axes[0].axis("off")
+
+            axes[1].imshow(res["corrected"], cmap="gray")
+            axes[1].set_title("2. Preprocessed")
+            axes[1].axis("off")
+
+            axes[2].imshow(res["edge_map"], cmap="inferno")
+            axes[2].set_title("3. HPF Edge")
+            axes[2].axis("off")
+
+            axes[3].imshow(res["binary_final"], cmap="gray")
+            axes[3].set_title(f"4. Binary (R={res['open_r']}, T={res['thresh']})")
+            axes[3].axis("off")
+
+            axes[4].imshow(res["labeled"], cmap="nipy_spectral")
+            axes[4].set_title(f"5. Counted: {res['count']}")
+            axes[4].axis("off")
+
+            for cy, cx in res["centroids"]:
+                axes[4].plot(cx, cy, "w+", markersize=6, markeredgewidth=1.2)
+
+            plt.tight_layout()
+            st.pyplot(fig)
+            plt.close(fig)
+
+        summary_data.append({
+            "파일명": uploaded_file.name,
+            "해상도": f"{img_pil.width} x {img_pil.height}",
+            "검출된 객체 수": res["count"],
+            "적용 임계값": res["thresh"],
+            "Opening 반경": res["open_r"]
+        })
+
+    st.divider()
+    st.subheader("전체 카운팅 결과 요약")
+    st.dataframe(summary_data, use_container_width=True)
